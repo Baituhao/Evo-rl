@@ -1,0 +1,208 @@
+{
+    "dataset": {
+        "repo_id": "lerobot-data-collection/level12_quality0_2026-02-08",
+        "root": null,
+        "episodes": null,
+        "image_transforms": {
+            "enable": false,
+            "max_num_transforms": 3,
+            "random_order": false,
+            "tfs": {
+                "brightness": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "brightness": [
+                            0.8,
+                            1.2
+                        ]
+                    }
+                },
+                "contrast": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "contrast": [
+                            0.8,
+                            1.2
+                        ]
+                    }
+                },
+                "saturation": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "saturation": [
+                            0.5,
+                            1.5
+                        ]
+                    }
+                },
+                "hue": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "hue": [
+                            -0.05,
+                            0.05
+                        ]
+                    }
+                },
+                "sharpness": {
+                    "weight": 1.0,
+                    "type": "SharpnessJitter",
+                    "kwargs": {
+                        "sharpness": [
+                            0.5,
+                            1.5
+                        ]
+                    }
+                },
+                "affine": {
+                    "weight": 1.0,
+                    "type": "RandomAffine",
+                    "kwargs": {
+                        "degrees": [
+                            -5.0,
+                            5.0
+                        ],
+                        "translate": [
+                            0.05,
+                            0.05
+                        ]
+                    }
+                }
+            }
+        },
+        "revision": null,
+        "use_imagenet_stats": true,
+        "video_backend": "torchcodec",
+        "streaming": false
+    },
+    "env": null,
+    "policy": {
+        "type": "sarm",
+        "n_obs_steps": 8,
+        "input_features": {
+            "observation.images.base": {
+                "type": "VISUAL",
+                "shape": [
+                    480,
+                    640,
+                    3
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    32
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    16
+                ]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "use_peft": false,
+        "push_to_hub": true,
+        "repo_id": "lerobot-data-collection/level2_sarm9",
+        "private": null,
+        "tags": null,
+        "license": null,
+        "pretrained_path": "lerobot-data-collection/sarm_lv2_10k",
+        "annotation_mode": "single_stage",
+        "frame_gap": 30,
+        "max_rewind_steps": 4,
+        "image_dim": 512,
+        "text_dim": 512,
+        "hidden_dim": 768,
+        "num_heads": 12,
+        "num_layers": 8,
+        "max_state_dim": 32,
+        "drop_n_last_frames": 1,
+        "batch_size": 64,
+        "clip_batch_size": 64,
+        "dropout": 0.1,
+        "stage_loss_weight": 1.0,
+        "rewind_probability": 0.8,
+        "language_perturbation_probability": 0.2,
+        "num_sparse_stages": 1,
+        "sparse_subtask_names": [
+            "task"
+        ],
+        "sparse_temporal_proportions": [
+            1.0
+        ],
+        "num_dense_stages": null,
+        "dense_subtask_names": null,
+        "dense_temporal_proportions": null,
+        "pretrained_model_path": null,
+        "image_key": "observation.images.base",
+        "state_key": "observation.state",
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "LANGUAGE": "IDENTITY",
+            "REWARD": "IDENTITY"
+        }
+    },
+    "output_dir": "/fsx/pepijn/outputs/shirt-folding-sarm-9feb2",
+    "job_name": "sarm",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 4,
+    "batch_size": 32,
+    "steps": 5000,
+    "eval_freq": 20000,
+    "log_freq": 200,
+    "tolerance_s": 0.01,
+    "save_checkpoint": true,
+    "save_freq": 2500,
+    "use_policy_training_preset": true,
+    "optimizer": {
+        "type": "adamw",
+        "lr": 5e-05,
+        "weight_decay": 0.001,
+        "grad_clip_norm": 10.0,
+        "betas": [
+            0.9,
+            0.999
+        ],
+        "eps": 1e-08
+    },
+    "scheduler": {
+        "type": "cosine_decay_with_warmup",
+        "num_warmup_steps": 500,
+        "num_decay_steps": 5000,
+        "peak_lr": 5e-05,
+        "decay_lr": 5e-06
+    },
+    "eval": {
+        "n_episodes": 50,
+        "batch_size": 50,
+        "use_async_envs": false
+    },
+    "wandb": {
+        "enable": true,
+        "disable_artifact": false,
+        "project": "sarm",
+        "entity": null,
+        "notes": null,
+        "run_id": "losgneoh",
+        "mode": null
+    },
+    "peft": null,
+    "use_rabc": false,
+    "rabc_progress_path": null,
+    "rabc_kappa": 0.01,
+    "rabc_epsilon": 1e-06,
+    "rabc_head_mode": "sparse",
+    "rename_map": {},
+    "checkpoint_path": null
+}

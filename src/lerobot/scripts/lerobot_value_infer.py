@@ -50,7 +50,15 @@ from lerobot.utils.utils import init_logging, inside_slurm
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
 from lerobot.values.pistar06.modeling_pistar06 import (
     EpisodeTargetInfo,
-    compute_normalized_value_targets,
+    compute_normalized_value_targets as compute_pistar06_normalized_value_targets,
+    compute_dense_rewards_from_targets as compute_pistar06_dense_rewards_from_targets,
+    compute_n_step_advantages as compute_pistar06_n_step_advantages,
+)
+from lerobot.values.value01.configuration_value01 import Value01Config
+from lerobot.values.value01.modeling_value01 import (
+    compute_normalized_value_targets as compute_value01_normalized_value_targets,
+    compute_dense_rewards_from_targets as compute_value01_dense_rewards_from_targets,
+    compute_n_step_advantages as compute_value01_n_step_advantages,
 )
 
 
@@ -191,10 +199,19 @@ def _build_episode_info(
         ep_idx = int(episodes["episode_index"][i])
         ep_length = int(episodes["length"][i])
         tasks = episodes["tasks"][i]
-        task_name = tasks[0] if isinstance(tasks, list) else tasks
-        if task_name not in dataset.meta.tasks.index:
-            raise KeyError(f"Episode {ep_idx} references unknown task '{task_name}'.")
-        task_index = int(dataset.meta.tasks.loc[task_name].task_index)
+        task_name = tasks[0] if isinstance(tasks, (list, np.ndarray)) else tasks
+        # Compatible with two modes:
+        # 1. task_name is a string task name (index into tasks DataFrame)
+        # 2. task_name is an integer task index directly
+        try:
+            task_index = int(task_name)
+            # Verify the task index exists
+            if task_index not in dataset.meta.tasks["task_index"].values:
+                raise KeyError(f"Episode {ep_idx} references unknown task index {task_index}.")
+        except (ValueError, TypeError):
+            if task_name not in dataset.meta.tasks.index:
+                raise KeyError(f"Episode {ep_idx} references unknown task '{task_name}'.")
+            task_index = int(dataset.meta.tasks.loc[task_name].task_index)
 
         explicit_success = episodes[success_field][i] if has_success else None
         resolved_success = resolve_episode_success_label(
@@ -214,66 +231,97 @@ def _build_episode_info(
     return episode_info, task_max_length
 
 
-def _compute_dense_rewards_from_targets(
+def _compute_value_targets(
+    value_cfg: Pistar06Config | Value01Config,
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    episode_info: dict[int, EpisodeTargetInfo],
+    task_max_lengths: dict[int, int],
+    c_fail_coef: float,
+) -> np.ndarray:
+    value_type = getattr(value_cfg, "type", None)
+    if value_type is None:
+        if isinstance(value_cfg, Pistar06Config):
+            value_type = "pistar06"
+        elif isinstance(value_cfg, Value01Config):
+            value_type = "value01"
+
+    if value_type == "pistar06":
+        compute_targets_fn = compute_pistar06_normalized_value_targets
+    elif value_type == "value01":
+        compute_targets_fn = compute_value01_normalized_value_targets
+    else:
+        raise ValueError(
+            f"Unsupported value type '{value_type}'. "
+            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
+        )
+
+    return compute_targets_fn(
+        episode_indices=episode_indices,
+        frame_indices=frame_indices,
+        episode_info=episode_info,
+        task_max_lengths=task_max_lengths,
+        c_fail_coef=c_fail_coef,
+        clip_min=value_cfg.bin_min,
+        clip_max=value_cfg.bin_max,
+    )
+
+def _compute_rewards(
+    value_cfg: Pistar06Config | Value01Config,
     targets: np.ndarray,
     episode_indices: np.ndarray,
     frame_indices: np.ndarray,
+    episode_info: dict[int, EpisodeTargetInfo],
 ) -> np.ndarray:
-    rewards = np.zeros_like(targets, dtype=np.float32)
-    n = targets.shape[0]
+    value_type = getattr(value_cfg, "type", None)
+    if value_type is None:
+        if isinstance(value_cfg, Pistar06Config):
+            value_type = "pistar06"
+        elif isinstance(value_cfg, Value01Config):
+            value_type = "value01"
 
-    for i in range(n):
-        is_next_in_episode = (
-            i + 1 < n
-            and episode_indices[i + 1] == episode_indices[i]
-            and frame_indices[i + 1] == frame_indices[i] + 1
+    if value_type == "pistar06":
+        return compute_pistar06_dense_rewards_from_targets(targets, episode_indices, frame_indices)
+    elif value_type == "value01":
+        return compute_value01_dense_rewards_from_targets(targets, episode_indices, frame_indices, episode_info)
+    else:
+        raise ValueError(
+            f"Unsupported value type '{value_type}'. "
+            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
         )
-        if is_next_in_episode:
-            rewards[i] = float(targets[i] - targets[i + 1])
-        else:
-            rewards[i] = float(targets[i])
 
-    return rewards
-
-
-def _compute_n_step_advantages(
+def _compute_advantages(
+    value_cfg: Pistar06Config | Value01Config,
     rewards: np.ndarray,
     values: np.ndarray,
     episode_indices: np.ndarray,
     frame_indices: np.ndarray,
     n_step: int,
+    episode_info: dict[int, EpisodeTargetInfo],
 ) -> np.ndarray:
-    if n_step <= 0:
-        raise ValueError("'n_step' must be > 0.")
+    value_type = getattr(value_cfg, "type", None)
+    if value_type is None:
+        if isinstance(value_cfg, Pistar06Config):
+            value_type = "pistar06"
+        elif isinstance(value_cfg, Value01Config):
+            value_type = "value01"
 
-    n = rewards.shape[0]
-    advantages = np.zeros(n, dtype=np.float32)
-
-    for i in range(n):
-        ep_i = episode_indices[i]
-        fi = frame_indices[i]
-
-        discounted_sum = 0.0
-        j = i
-        steps = 0
-        while steps < n_step and j < n:
-            same_episode = episode_indices[j] == ep_i
-            contiguous = frame_indices[j] == fi + steps
-            if not same_episode or not contiguous:
-                break
-
-            discounted_sum += float(rewards[j])
-            steps += 1
-            j += 1
-
-        if steps == n_step and j < n and episode_indices[j] == ep_i and frame_indices[j] == fi + n_step:
-            bootstrap = float(values[j])
-        else:
-            bootstrap = 0.0
-
-        advantages[i] = float(discounted_sum + bootstrap - values[i])
-
-    return advantages
+    if value_type == "pistar06":
+        return compute_pistar06_n_step_advantages(rewards, values, episode_indices, frame_indices, n_step)
+    elif value_type == "value01":
+        return compute_value01_n_step_advantages(
+            rewards,
+            values,
+            episode_indices,
+            frame_indices,
+            n_step,
+            episode_info,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported value type '{value_type}'. "
+            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
+        )
 
 
 def _compute_task_thresholds(
@@ -303,6 +351,8 @@ def _binarize_advantages(
     thresholds: dict[int, float],
     interventions: np.ndarray,
     force_intervention_positive: bool,
+    expert_episode_mask: np.ndarray,
+    force_expert_episode_positive: bool,
 ) -> np.ndarray:
     indicators = np.zeros_like(advantages, dtype=np.int64)
 
@@ -315,7 +365,31 @@ def _binarize_advantages(
         intervention_mask = interventions.astype(np.float32) > 0.5
         indicators[intervention_mask] = 1
 
+    if force_expert_episode_positive:
+        indicators[expert_episode_mask] = 1
+
     return indicators
+
+
+def _compute_episode_positive_mask(
+    episode_indices: np.ndarray,
+    episode_labels: np.ndarray,
+) -> np.ndarray:
+    if episode_indices.ndim != 1:
+        raise ValueError("'episode_indices' must be rank-1.")
+    if episode_labels.ndim != 1:
+        raise ValueError("'episode_labels' must be rank-1.")
+    if episode_indices.shape[0] != episode_labels.shape[0]:
+        raise ValueError(
+            f"'episode_indices' and 'episode_labels' must have the same length, got "
+            f"{episode_indices.shape[0]} and {episode_labels.shape[0]}."
+        )
+
+    positive_episode_ids = np.unique(episode_indices[episode_labels.astype(np.float32) > 0.5])
+    if positive_episode_ids.size == 0:
+        return np.zeros_like(episode_indices, dtype=np.bool_)
+
+    return np.isin(episode_indices, positive_episode_ids)
 
 
 def _update_feature_metadata(dataset_root: Path, feature_infos: dict[str, dict[str, Any]]) -> None:
@@ -403,9 +477,10 @@ def _load_value_policy_and_processors(
     device: torch.device,
 ):
     value_cfg = PreTrainedConfig.from_pretrained(pretrained_dir)
-    if not isinstance(value_cfg, Pistar06Config):
+    if not isinstance(value_cfg, (Pistar06Config, Value01Config)):
         raise ValueError(
-            f"Unsupported value config type '{type(value_cfg)}'. lerobot-value-infer currently supports only 'pistar06'."
+            f"Unsupported value config type '{type(value_cfg)}'. "
+            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
         )
 
     value_cfg.pretrained_path = pretrained_dir
@@ -513,19 +588,28 @@ def run_value_inference_pipeline(
         device=device,
     )
 
-    absolute_indices = np.asarray(raw_frames["index"], dtype=np.int64)
+    absolute_indices = np.asarray(raw_frames["index"], dtype=np.int64).reshape(-1)
 
     if value_cfg.task_index_feature not in raw_frames.column_names:
         raise KeyError(f"Missing task feature '{value_cfg.task_index_feature}' in dataset columns.")
 
-    task_indices = np.asarray(raw_frames[value_cfg.task_index_feature], dtype=np.int64)
-    episode_indices = np.asarray(raw_frames["episode_index"], dtype=np.int64)
-    frame_indices = np.asarray(raw_frames["frame_index"], dtype=np.int64)
+    task_indices = np.asarray(raw_frames[value_cfg.task_index_feature], dtype=np.int64).reshape(-1)
+    episode_indices = np.asarray(raw_frames["episode_index"], dtype=np.int64).reshape(-1)
+    frame_indices = np.asarray(raw_frames["frame_index"], dtype=np.int64).reshape(-1)
 
     if cfg.acp.intervention_field in raw_frames.column_names:
-        interventions = np.asarray(raw_frames[cfg.acp.intervention_field], dtype=np.float32)
+        interventions = np.asarray(raw_frames[cfg.acp.intervention_field], dtype=np.float32).reshape(-1)
     else:
         interventions = np.zeros(frame_count, dtype=np.float32)
+
+    if cfg.acp.expert_episode_field in raw_frames.column_names:
+        expert_episode_labels = np.asarray(raw_frames[cfg.acp.expert_episode_field], dtype=np.float32).reshape(-1)
+        expert_episode_mask = _compute_episode_positive_mask(
+            episode_indices=episode_indices,
+            episode_labels=expert_episode_labels,
+        )
+    else:
+        expert_episode_mask = np.zeros(frame_count, dtype=np.bool_)
 
     eval_loader = DataLoader(
         dataset,
@@ -620,22 +704,29 @@ def run_value_inference_pipeline(
                 default_success=cfg.dataset.default_success,
             )
 
-            value_targets = compute_normalized_value_targets(
+            value_targets = _compute_value_targets(
+                value_cfg=value_cfg,
                 episode_indices=episode_indices,
                 frame_indices=frame_indices,
                 episode_info=episode_info,
                 task_max_lengths=task_max_lengths,
                 c_fail_coef=cfg.acp.c_fail_coef,
-                clip_min=value_cfg.bin_min,
-                clip_max=value_cfg.bin_max,
             )
-            rewards = _compute_dense_rewards_from_targets(value_targets, episode_indices, frame_indices)
-            advantages = _compute_n_step_advantages(
+            rewards = _compute_rewards(
+                value_cfg=value_cfg,
+                targets=value_targets,
+                episode_indices=episode_indices,
+                frame_indices=frame_indices,
+                episode_info=episode_info,
+            )
+            advantages = _compute_advantages(
+                value_cfg=value_cfg,
                 rewards=rewards,
                 values=predicted_values,
                 episode_indices=episode_indices,
                 frame_indices=frame_indices,
                 n_step=cfg.acp.n_step,
+                episode_info=episode_info,
             )
             thresholds = _compute_task_thresholds(
                 task_indices=task_indices,
@@ -648,6 +739,8 @@ def run_value_inference_pipeline(
                 thresholds=thresholds,
                 interventions=interventions,
                 force_intervention_positive=cfg.acp.force_intervention_positive,
+                expert_episode_mask=expert_episode_mask,
+                force_expert_episode_positive=cfg.acp.force_expert_episode_positive,
             )
 
             indicator_positive_ratio = float(np.mean(indicators.astype(np.float32)))
@@ -656,6 +749,16 @@ def run_value_inference_pipeline(
                 cfg.acp.n_step,
                 cfg.acp.positive_ratio,
                 indicator_positive_ratio,
+            )
+            logging.info(
+                "ACP overrides | intervention_positive=%s intervention_frames=%d expert_episode_positive=%s "
+                "expert_episode_field=%s expert_episodes=%d expert_episode_frames=%d",
+                cfg.acp.force_intervention_positive,
+                int(np.sum(interventions.astype(np.float32) > 0.5)),
+                cfg.acp.force_expert_episode_positive,
+                cfg.acp.expert_episode_field,
+                int(np.unique(episode_indices[expert_episode_mask]).shape[0]) if bool(np.any(expert_episode_mask)) else 0,
+                int(np.sum(expert_episode_mask)),
             )
 
             columns[cfg.acp.advantage_field] = advantages.astype(np.float32)

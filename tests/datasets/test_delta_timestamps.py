@@ -11,8 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import pytest
+from types import SimpleNamespace
 
+import pytest
+import torch
+
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import (
     check_delta_timestamps,
     get_delta_indices,
@@ -136,3 +141,86 @@ def test_delta_indices(valid_delta_timestamps_factory, delta_indices_factory):
     expected_delta_indices = delta_indices_factory(min_max_range=min_max_range)
     actual_delta_indices = get_delta_indices(delta_timestamps, fps)
     assert expected_delta_indices == actual_delta_indices
+
+
+def test_resolve_delta_timestamps_uses_only_declared_observation_features():
+    cfg = SimpleNamespace(
+        input_features={
+            "observation.images.head": object(),
+            "observation.state": object(),
+        },
+        observation_delta_indices=[-1, 0, 1],
+        action_delta_indices=None,
+        reward_delta_indices=None,
+    )
+    ds_meta = SimpleNamespace(
+        fps=30,
+        features={
+            "observation.images.head": {},
+            "observation.images.left": {},
+            "observation.images.right": {},
+            "observation.state": {},
+            "action": {},
+        },
+    )
+
+    delta_timestamps = resolve_delta_timestamps(cfg, ds_meta)
+
+    assert delta_timestamps == {
+        "observation.images.head": [-1 / 30, 0.0, 1 / 30],
+        "observation.state": [-1 / 30, 0.0, 1 / 30],
+    }
+
+
+def test_resolve_delta_timestamps_falls_back_to_all_observation_features_when_names_do_not_match():
+    cfg = SimpleNamespace(
+        input_features={
+            "observation.images.camera1": object(),
+            "observation.state": object(),
+        },
+        observation_delta_indices=[0],
+        action_delta_indices=None,
+        reward_delta_indices=None,
+    )
+    ds_meta = SimpleNamespace(
+        fps=30,
+        features={
+            "observation.images.top": {},
+            "observation.images.side": {},
+            "observation.state": {},
+            "action": {},
+        },
+    )
+
+    delta_timestamps = resolve_delta_timestamps(cfg, ds_meta)
+
+    assert delta_timestamps == {
+        "observation.images.top": [0.0],
+        "observation.images.side": [0.0],
+        "observation.state": [0.0],
+    }
+
+
+def test_lerobot_dataset_query_timestamps_defaults_missing_video_keys_to_current_frame():
+    class MockHFDataset:
+        def __init__(self, timestamps):
+            self.timestamps = timestamps
+
+        def __getitem__(self, key):
+            if isinstance(key, list):
+                return {"timestamp": [self.timestamps[idx] for idx in key]}
+            raise TypeError(f"Unsupported key type: {type(key)}")
+
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.meta = SimpleNamespace(video_keys=["observation.images.head", "observation.images.left"])
+    dataset._absolute_to_relative_idx = None
+    dataset.hf_dataset = MockHFDataset([torch.tensor(0.1), torch.tensor(0.2), torch.tensor(0.3)])
+
+    query_timestamps = dataset._get_query_timestamps(
+        current_ts=0.0,
+        query_indices={"observation.images.head": [0, 1], "observation.state": [0, 1]},
+    )
+
+    assert list(query_timestamps) == ["observation.images.head", "observation.images.left"]
+    assert query_timestamps["observation.images.head"] == pytest.approx([0.1, 0.2])
+    assert query_timestamps["observation.images.left"] == pytest.approx([0.0])

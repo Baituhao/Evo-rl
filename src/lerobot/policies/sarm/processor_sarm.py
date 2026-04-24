@@ -22,8 +22,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F  # noqa: N812
 from faker import Faker
-from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -278,7 +278,12 @@ class SARMEncodingProcessorStep(ProcessorStep):
         # When language is perturbed, targets are zero so perturbed samples don't contribute to progress loss
         if self.dataset_meta is not None:
             episodes_df = None
-            if self.sparse_subtask_names != ["task"]:
+            needs_episode_df = self.sparse_subtask_names != ["task"] or (
+                self.config.uses_dual_heads
+                and self.dense_subtask_names is not None
+                and len(self.dense_subtask_names) > 1
+            )
+            if needs_episode_df:
                 episodes_df = self.dataset_meta.episodes.to_pandas()
 
             # Generate sparse targets
@@ -410,6 +415,7 @@ class SARMEncodingProcessorStep(ProcessorStep):
 
         batch_size, seq_length = images.shape[0], images.shape[1]
         images = images.reshape(batch_size * seq_length, *images.shape[2:])
+        images = self._maybe_downsample_images(images)
 
         num_frames = images.shape[0]
         images_list = []
@@ -425,7 +431,7 @@ class SARMEncodingProcessorStep(ProcessorStep):
             if img.dtype != np.uint8:
                 img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
 
-            images_list.append(Image.fromarray(img))
+            images_list.append(img)
 
         all_embeddings = []
         for i in range(0, num_frames, self.config.clip_batch_size):
@@ -447,6 +453,32 @@ class SARMEncodingProcessorStep(ProcessorStep):
         all_embeddings = all_embeddings.reshape(batch_size, seq_length, -1)  # (B, T, 512)
 
         return all_embeddings
+
+    def _maybe_downsample_images(self, images: np.ndarray) -> np.ndarray:
+        """Resize frames before CLIP preprocessing when configured."""
+        target_size = self.config.image_downsample_size
+        if target_size is None:
+            return images
+
+        target_height, target_width = target_size
+        current_height, current_width = images.shape[-2:]
+        if (current_height, current_width) == (target_height, target_width):
+            return images
+
+        image_tensor = torch.from_numpy(images).float()
+        align_corners = False if self.config.image_downsample_mode in {"bilinear", "bicubic"} else None
+        antialias = self.config.image_downsample_antialias if self.config.image_downsample_mode in {
+            "bilinear",
+            "bicubic",
+        } else False
+        resized = F.interpolate(
+            image_tensor,
+            size=(target_height, target_width),
+            mode=self.config.image_downsample_mode,
+            align_corners=align_corners,
+            antialias=antialias,
+        )
+        return resized.numpy()
 
     @torch.no_grad()
     def _encode_text_clip(self, text: str, batch_size: int) -> torch.Tensor:

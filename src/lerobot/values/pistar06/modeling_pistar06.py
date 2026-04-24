@@ -121,6 +121,65 @@ def compute_normalized_value_targets(
 
     return targets
 
+def compute_dense_rewards_from_targets(
+    targets: np.ndarray,
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+) -> np.ndarray:
+    rewards = np.zeros_like(targets, dtype=np.float32)
+    n = targets.shape[0]
+
+    for i in range(n):
+        is_next_in_episode = (
+            i + 1 < n
+            and episode_indices[i + 1] == episode_indices[i]
+            and frame_indices[i + 1] == frame_indices[i] + 1
+        )
+        if is_next_in_episode:
+            rewards[i] = float(targets[i] - targets[i + 1])
+        else:
+            rewards[i] = float(targets[i])
+
+    return rewards
+
+def compute_n_step_advantages(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    n_step: int,
+) -> np.ndarray:
+    if n_step <= 0:
+        raise ValueError("'n_step' must be > 0.")
+
+    n = rewards.shape[0]
+    advantages = np.zeros(n, dtype=np.float32)
+
+    for i in range(n):
+        ep_i = episode_indices[i]
+        fi = frame_indices[i]
+
+        discounted_sum = 0.0
+        j = i
+        steps = 0
+        while steps < n_step and j < n:
+            same_episode = episode_indices[j] == ep_i
+            contiguous = frame_indices[j] == fi + steps
+            if not same_episode or not contiguous:
+                break
+
+            discounted_sum += float(rewards[j])
+            steps += 1
+            j += 1
+
+        if steps == n_step and j < n and episode_indices[j] == ep_i and frame_indices[j] == fi + n_step:
+            bootstrap = float(values[j])
+        else:
+            bootstrap = 0.0
+
+        advantages[i] = float(discounted_sum + bootstrap - values[i])
+
+    return advantages
 
 def _resolve_load_dtype(dtype_name: str) -> torch.dtype:
     requested_dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32

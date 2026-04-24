@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +27,25 @@ EPISODE_FAILURE = "failure"
 VALID_EPISODE_SUCCESS_LABELS = {EPISODE_SUCCESS, EPISODE_FAILURE}
 
 
-def normalize_episode_success_label(label: str | None) -> str | None:
+def normalize_episode_success_label(label: Any | None) -> str | None:
     """Normalize a user-provided episode label to canonical lowercase values."""
     if label is None:
         return None
+    if hasattr(label, "item") and not isinstance(label, (str, bytes)):
+        label = label.item()
+    if isinstance(label, bool):
+        return EPISODE_SUCCESS if label else EPISODE_FAILURE
+    if isinstance(label, Integral):
+        if int(label) == 1:
+            return EPISODE_SUCCESS
+        if int(label) == 0:
+            return EPISODE_FAILURE
     normalized = label.strip().lower()
     if normalized not in VALID_EPISODE_SUCCESS_LABELS:
+        if normalized in {"true", "1"}:
+            return EPISODE_SUCCESS
+        if normalized in {"false", "0"}:
+            return EPISODE_FAILURE
         raise ValueError(
             f"`episode_success` must be one of {sorted(VALID_EPISODE_SUCCESS_LABELS)}, got '{label}'."
         )

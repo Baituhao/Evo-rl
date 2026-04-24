@@ -38,6 +38,7 @@ class ACPConfig:
     enable: bool = False
     indicator_field: str = "complementary_info.acp_indicator"
     indicator_dropout_prob: float = 0.0
+    log: bool = False  # log task prompt content during rollout for debug
 
 
 @dataclass

@@ -48,6 +48,8 @@ The output is saved to the dataset's local cache directory as 'sarm_progress.par
 import argparse
 import logging
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
@@ -55,12 +57,75 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
 from lerobot.policies.sarm.sarm_utils import normalize_stage_tau
+
+
+class PrefetchIterator:
+    """Single-threaded prefetch wrapper using a background thread."""
+
+    def __init__(self, iterable, prefetch_size=2):
+        self.iterable = iter(iterable)
+        self.queue = Queue(maxsize=prefetch_size)
+        self.thread = Thread(target=self._producer, daemon=True)
+        self.thread.start()
+
+    def _producer(self):
+        try:
+            for item in self.iterable:
+                self.queue.put(item)
+        except Exception as e:
+            self.queue.put(e)
+        finally:
+            self.queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is None:
+            raise StopIteration
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def parse_episode_indices(value: str) -> list[int]:
+    """Parse comma-separated episode indices string into a list of ints."""
+    try:
+        return [int(x.strip()) for x in value.split(",") if x.strip()]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid episode indices '{value}': {e}") from e
+
+
+class FrameSubset(Dataset):
+    """Thin Dataset wrapper that maps a list of absolute frame indices to dataset items."""
+
+    def __init__(self, dataset: LeRobotDataset, frame_indices: list[int], image_key: str, state_key: str):
+        self.dataset = dataset
+        self.frame_indices = frame_indices
+        self.image_key = image_key
+        self.state_key = state_key
+
+    def __len__(self):
+        return len(self.frame_indices)
+
+    def __getitem__(self, i):
+        idx = self.frame_indices[i]
+        sample = self.dataset[idx]
+        item = {
+            self.image_key: sample[self.image_key],
+            "_frame_idx": idx,
+        }
+        if self.state_key in sample:
+            item[self.state_key] = sample[self.state_key]
+        return item
 
 
 def get_reward_model_path_from_parquet(parquet_path: Path) -> str | None:
@@ -74,6 +139,15 @@ def get_reward_model_path_from_parquet(parquet_path: Path) -> str | None:
     except Exception:  # nosec B110
         return None
     return None
+
+
+def _resolve_dataset_kwargs(dataset_repo_id: str) -> dict:
+    """Return LeRobotDataset kwargs, using local root when the path exists on disk."""
+    local_path = Path(dataset_repo_id)
+    if local_path.exists() and (local_path / "meta" / "info.json").exists():
+        logging.info(f"Detected local dataset at '{local_path}', loading offline.")
+        return {"repo_id": local_path.name, "root": str(local_path)}
+    return {"repo_id": dataset_repo_id}
 
 
 def load_sarm_resources(
@@ -97,14 +171,15 @@ def load_sarm_resources(
     delta_indices = reward_model.config.observation_delta_indices
 
     logging.info(f"Loading dataset: {dataset_repo_id}")
-    temp_dataset = LeRobotDataset(dataset_repo_id, download_videos=True)
+    ds_kwargs = _resolve_dataset_kwargs(dataset_repo_id)
+    temp_dataset = LeRobotDataset(**ds_kwargs, download_videos=True)
     fps = temp_dataset.fps
 
     delta_timestamps = {
         image_key: [idx / fps for idx in delta_indices],
         state_key: [idx / fps for idx in delta_indices],
     }
-    dataset = LeRobotDataset(dataset_repo_id, delta_timestamps=delta_timestamps)
+    dataset = LeRobotDataset(**ds_kwargs, delta_timestamps=delta_timestamps)
     logging.info(f"Dataset: {dataset.num_episodes} episodes, {dataset.num_frames} frames")
 
     preprocess, _ = make_sarm_pre_post_processors(
@@ -460,6 +535,18 @@ def interpolate_progress(
     return out.astype(np.float32)
 
 
+def _collate_passthrough(batch):
+    """Collate that stacks tensors but leaves non-tensor values as lists."""
+    out = {}
+    for key in batch[0]:
+        vals = [item[key] for item in batch]
+        if isinstance(vals[0], torch.Tensor):
+            out[key] = torch.stack(vals)
+        else:
+            out[key] = vals
+    return out
+
+
 def compute_sarm_progress(
     dataset_repo_id: str,
     reward_model_path: str,
@@ -469,6 +556,9 @@ def compute_sarm_progress(
     num_visualizations: int = 5,
     output_dir: str = "./sarm_viz",
     stride: int = 1,
+    episode_indices: list[int] | None = None,
+    num_workers: int = 0,
+    prefetch_size: int = 2,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -482,6 +572,9 @@ def compute_sarm_progress(
         num_visualizations: Number of episodes to visualize (0 to skip)
         output_dir: Directory to save visualizations
         stride: Compute progress every N frames, interpolate the rest (default: 1 = every frame)
+        episode_indices: List of episode indices to process. If None, processes all episodes.
+        num_workers: Number of DataLoader worker processes (default: 0 = single process, recommended for video datasets)
+        prefetch_size: Number of batches to prefetch (default: 2, works in both single/multi-process modes)
     """
     dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device)
 
@@ -497,7 +590,21 @@ def compute_sarm_progress(
     frame_gap = reward_model.config.frame_gap
     num_episodes = dataset.num_episodes
     total_frames = dataset.num_frames
-    logging.info(f"Processing {total_frames} frames across {num_episodes} episodes")
+
+    # Resolve which episodes to process
+    all_episode_set = set(range(num_episodes))
+    if episode_indices is not None:
+        invalid = set(episode_indices) - all_episode_set
+        if invalid:
+            raise ValueError(f"Episode indices out of range [0, {num_episodes - 1}]: {sorted(invalid)}")
+        episodes_to_process = sorted(set(episode_indices))
+        logging.info(
+            f"Processing {len(episodes_to_process)}/{num_episodes} selected episodes "
+            f"(out of {total_frames} total frames)"
+        )
+    else:
+        episodes_to_process = list(range(num_episodes))
+        logging.info(f"Processing {total_frames} frames across {num_episodes} episodes")
 
     # Determine which heads to compute
     dual_mode = reward_model.config.uses_dual_heads
@@ -513,9 +620,12 @@ def compute_sarm_progress(
 
     if stride > 1:
         logging.info(f"Using stride={stride}: computing every {stride} frames, interpolating the rest")
+    if prefetch_size > 0:
+        mode = f"multi-process (num_workers={num_workers})" if num_workers > 0 else "single-threaded"
+        logging.info(f"Prefetch enabled ({mode}): prefetch_size={prefetch_size}")
 
-    # Process all episodes
-    for episode_idx in tqdm(range(num_episodes), desc="Episodes"):
+    # Process selected episodes
+    for episode_idx in tqdm(episodes_to_process, desc="Episodes"):
         ep = dataset.meta.episodes[episode_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
@@ -541,21 +651,36 @@ def compute_sarm_progress(
         # Dictionary to collect results
         frame_results = {}
 
-        for query_idx in tqdm(compute_indices, desc=f"  Ep {episode_idx}", leave=False):
-            try:
-                sample = dataset[query_idx]
+        # Build a DataLoader over the frames to compute for this episode (enables prefetching)
+        frame_subset = FrameSubset(dataset, compute_indices, image_key, state_key)
+        loader_kwargs = dict(
+            batch_size=1,
+            shuffle=False,
+            collate_fn=_collate_passthrough,
+        )
+        if num_workers > 0:
+            loader_kwargs["num_workers"] = num_workers
+            loader_kwargs["prefetch_factor"] = prefetch_size
+        frame_loader = DataLoader(frame_subset, **loader_kwargs)
 
-                batch = {
-                    image_key: sample[image_key],
+        # Wrap with prefetch iterator for single-threaded mode
+        if num_workers == 0 and prefetch_size > 0:
+            frame_loader = PrefetchIterator(frame_loader, prefetch_size=prefetch_size)
+
+        for batch in tqdm(frame_loader, desc=f"  Ep {episode_idx}", leave=False):
+            query_idx = int(batch["_frame_idx"][0])
+            try:
+                item = {
+                    image_key: batch[image_key][0],
                     "task": task,
                     "index": query_idx,
                     "episode_index": episode_idx,
                 }
-                if state_key in sample:
-                    batch[state_key] = sample[state_key]
+                if state_key in batch:
+                    item[state_key] = batch[state_key][0]
 
                 with torch.no_grad():
-                    processed = preprocess(batch)
+                    processed = preprocess(item)
                     video_features = processed["video_features"].to(device)
                     text_features = processed["text_features"].to(device)
                     state_features = processed.get("state_features")
@@ -690,7 +815,8 @@ def compute_sarm_progress(
 
     # Visualize episodes after processing
     if num_visualizations > 0:
-        viz_episodes = list(range(min(num_visualizations, num_episodes)))
+        viz_pool = episodes_to_process
+        viz_episodes = viz_pool[: min(num_visualizations, len(viz_pool))]
         logging.info(f"Generating {len(viz_episodes)} visualizations...")
         visualize_sarm_predictions(
             dataset=dataset,
@@ -782,8 +908,27 @@ Examples:
     parser.add_argument(
         "--stride",
         type=int,
-        default=1,
+        default=9,
         help="Compute progress every N frames, interpolate the rest (default: 1 = every frame)",
+    )
+    parser.add_argument(
+        "--episode-indices",
+        type=parse_episode_indices,
+        default=None,
+        metavar="IDX1,IDX2,...",
+        help="Comma-separated episode indices to process (e.g. 0,1,5). Processes all episodes if not set.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader worker processes (default: 0 = single process, recommended for video datasets)",
+    )
+    parser.add_argument(
+        "--prefetch-size",
+        type=int,
+        default=2,
+        help="Number of batches to prefetch (default: 2, works in both single/multi-process modes)",
     )
 
     args = parser.parse_args()
@@ -794,7 +939,8 @@ Examples:
     reward_model_path = args.reward_model_path
     if reward_model_path is None:
         # Load dataset to find parquet path
-        temp_dataset = LeRobotDataset(args.dataset_repo_id, download_videos=False)
+        ds_kwargs = _resolve_dataset_kwargs(args.dataset_repo_id)
+        temp_dataset = LeRobotDataset(**ds_kwargs, download_videos=False)
         parquet_path = Path(temp_dataset.root) / "sarm_progress.parquet"
         reward_model_path = get_reward_model_path_from_parquet(parquet_path)
         if reward_model_path:
@@ -810,7 +956,8 @@ Examples:
             args.dataset_repo_id, reward_model_path, args.device
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
-        viz_episodes = list(range(min(args.num_visualizations, dataset.num_episodes)))
+        ep_pool = args.episode_indices if args.episode_indices is not None else list(range(dataset.num_episodes))
+        viz_episodes = ep_pool[: min(args.num_visualizations, len(ep_pool))]
         visualize_sarm_predictions(
             dataset=dataset,
             reward_model=reward_model,
@@ -833,6 +980,9 @@ Examples:
         num_visualizations=args.num_visualizations,
         output_dir=args.output_dir,
         stride=args.stride,
+        episode_indices=args.episode_indices,
+        num_workers=args.num_workers,
+        prefetch_size=args.prefetch_size,
     )
 
     print(f"\nSARM progress values saved to: {output_path}")

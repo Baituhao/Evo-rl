@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
 
@@ -120,6 +121,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         self.image_transforms = image_transforms
         self.episodes = episodes
+        self._episode_index_set = set(episodes) if episodes is not None else None
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.seed = seed
@@ -158,14 +160,35 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         )
 
         self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
+        self._num_frames = self.meta.total_frames
+        self._num_episodes = self.meta.total_episodes
+        if self.episodes is not None:
+            episodes_meta = self.meta.episodes.with_format(None)
+            frames_by_episode = {
+                int(ep_idx): int(to_idx) - int(from_idx)
+                for ep_idx, from_idx, to_idx in zip(
+                    episodes_meta["episode_index"],
+                    episodes_meta["dataset_from_index"],
+                    episodes_meta["dataset_to_index"],
+                    strict=False,
+                )
+            }
+            self._num_frames = sum(frames_by_episode.get(ep_idx, 0) for ep_idx in self.episodes)
+            self._num_episodes = len(self.episodes)
+            logging.debug(
+                "Streaming dataset '%s' restricted to %d episodes (%d frames).",
+                self.repo_id,
+                self._num_episodes,
+                self._num_frames,
+            )
 
     @property
     def num_frames(self):
-        return self.meta.total_frames
+        return self._num_frames
 
     @property
     def num_episodes(self):
-        return self.meta.total_episodes
+        return self._num_episodes
 
     @property
     def fps(self):
@@ -300,13 +323,17 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
     def make_frame(self, dataset_iterator: Backtrackable) -> Generator:
         """Makes a frame starting from a dataset iterator"""
-        item = next(dataset_iterator)
-        item = item_to_torch(item)
+        while True:
+            item = next(dataset_iterator)
+            item = item_to_torch(item)
+            ep_idx = int(item["episode_index"])
+            if self._episode_index_set is None or ep_idx in self._episode_index_set:
+                break
 
         updates = []  # list of "updates" to apply to the item retrieved from hf_dataset (w/o camera features)
 
         # Get episode index from the item
-        ep_idx = item["episode_index"]
+        ep_idx = int(item["episode_index"])
 
         # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
         current_ts = item["index"] / self.fps
@@ -336,7 +363,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             video_frames = self._query_videos(query_timestamps, ep_idx)
 
             if self.image_transforms is not None:
-                image_keys = self.meta.camera_keys
+                image_keys = [cam for cam in self.meta.camera_keys if cam in video_frames]
                 for cam in image_keys:
                     video_frames[cam] = self.image_transforms(video_frames[cam])
 

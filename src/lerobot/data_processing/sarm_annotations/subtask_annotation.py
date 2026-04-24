@@ -950,7 +950,13 @@ def worker_process_episodes(
 
 def main():
     parser = argparse.ArgumentParser(description="SARM-style subtask annotation using local GPU (Qwen3-VL)")
-    parser.add_argument("--repo-id", type=str, required=True, help="HuggingFace dataset repository ID")
+    parser.add_argument("--repo-id", type=str, default=None, help="HuggingFace dataset repository ID")
+    parser.add_argument(
+        "--dataset-root",
+        type=str,
+        default=None,
+        help="Local LeRobotDataset root. When provided, load dataset directly from disk.",
+    )
     parser.add_argument(
         "--sparse-subtasks", type=str, default=None, help="Comma-separated sparse subtask names"
     )
@@ -998,9 +1004,16 @@ def main():
 
     args = parser.parse_args()
 
+    if bool(args.repo_id) == bool(args.dataset_root):
+        return print("Error: specify exactly one of --repo-id or --dataset-root")
+
     # Load dataset first (needed for both annotation and visualization)
-    print(f"Loading dataset: {args.repo_id}")
-    dataset = LeRobotDataset(args.repo_id, download_videos=True)
+    dataset_ref = args.dataset_root or args.repo_id
+    print(f"Loading dataset: {dataset_ref}")
+    if args.dataset_root:
+        dataset = LeRobotDataset("local/local-dataset", root=args.dataset_root, download_videos=True)
+    else:
+        dataset = LeRobotDataset(args.repo_id, download_videos=True)
     fps = dataset.fps
 
     if not dataset.meta.video_keys:
@@ -1094,7 +1107,7 @@ def main():
                         w,
                         gpu_ids[w],
                         episodes_per_worker[w],
-                        args.repo_id,
+                        args.dataset_root if args.dataset_root else args.repo_id,
                         video_key,
                         sparse_subtask_list,
                         dense_subtask_list,
@@ -1191,7 +1204,12 @@ def main():
         )
 
     if args.push_to_hub:
+        if args.dataset_root and not args.output_repo_id:
+            print("Push skipped: local dataset mode requires --output-repo-id for push_to_hub.")
+            return
         try:
+            if args.output_repo_id:
+                dataset.repo_id = args.output_repo_id
             dataset.push_to_hub(push_videos=True)
             print(f"Pushed to {args.output_repo_id or args.repo_id}")
         except Exception as e:

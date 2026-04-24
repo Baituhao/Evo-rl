@@ -21,6 +21,7 @@ from lerobot import envs, policies  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.default import EvalConfig
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.train import ACPConfig
 
 logger = getLogger(__name__)
 
@@ -33,6 +34,7 @@ class EvalPipelineConfig:
     env: envs.EnvConfig
     eval: EvalConfig = field(default_factory=EvalConfig)
     policy: PreTrainedConfig | None = None
+    acp: ACPConfig = field(default_factory=ACPConfig)
     output_dir: Path | None = None
     job_name: str | None = None
     seed: int | None = 1000

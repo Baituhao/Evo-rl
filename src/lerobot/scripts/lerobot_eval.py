@@ -71,6 +71,7 @@ from tqdm import trange
 
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
+from lerobot.configs.train import ACPConfig
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import (
     add_envs_task,
@@ -81,6 +82,7 @@ from lerobot.envs.utils import (
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
+from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -99,6 +101,7 @@ def rollout(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    acp_cfg: ACPConfig | None = None,
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
@@ -168,6 +171,16 @@ def rollout(
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
         observation = add_envs_task(env, observation)
+
+        # ACP: inject "Advantage: positive" tag into task prompt if enabled.
+        if acp_cfg is not None and acp_cfg.enable:
+            observation["task"] = [
+                build_acp_tagged_task(task, is_positive=True) for task in observation["task"]
+            ]
+
+        if acp_cfg is not None and acp_cfg.log:
+            for i, task in enumerate(observation["task"]):
+                logging.debug("[ACP][step=%d][env=%d] task prompt: %r", step, i, task)
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
@@ -255,6 +268,7 @@ def eval_policy(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
+    acp_cfg: ACPConfig | None = None,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
@@ -343,6 +357,7 @@ def eval_policy(
             env_postprocessor=env_postprocessor,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
+            acp_cfg=acp_cfg,
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
@@ -557,6 +572,7 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
+            acp_cfg=cfg.acp,
             max_episodes_rendered=10,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
@@ -599,6 +615,7 @@ def eval_one(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
+    acp_cfg: ACPConfig | None,
     max_episodes_rendered: int,
     videos_dir: Path | None,
     return_episode_data: bool,
@@ -616,6 +633,7 @@ def eval_one(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         n_episodes=n_episodes,
+        acp_cfg=acp_cfg,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
@@ -642,6 +660,7 @@ def run_one(
     preprocessor,
     postprocessor,
     n_episodes: int,
+    acp_cfg: ACPConfig | None,
     max_episodes_rendered: int,
     videos_dir: Path | None,
     return_episode_data: bool,
@@ -666,6 +685,7 @@ def run_one(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         n_episodes=n_episodes,
+        acp_cfg=acp_cfg,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
@@ -686,6 +706,7 @@ def eval_policy_all(
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
     *,
+    acp_cfg: ACPConfig | None = None,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
@@ -742,6 +763,7 @@ def eval_policy_all(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         n_episodes=n_episodes,
+        acp_cfg=acp_cfg,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,

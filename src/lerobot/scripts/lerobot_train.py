@@ -28,7 +28,7 @@ from torch.optim import Optimizer
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import EpisodeAwareSampler, resolve_episode_indices_to_use
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -355,6 +355,59 @@ def train(
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    selected_training_episodes = resolve_episode_indices_to_use(
+        dataset.meta.episodes,
+        requested_episodes=dataset.episodes,
+        omit_failed=cfg.dataset.omit_failed,
+        repo_id=cfg.dataset.repo_id,
+    )
+    drop_n_last_frames = getattr(cfg.policy, "drop_n_last_frames", 0)
+    use_episode_sampler = bool(cfg.dataset.omit_failed or drop_n_last_frames > 0)
+    if use_episode_sampler:
+        if cfg.dataset.streaming:
+            raise NotImplementedError(
+                "'dataset.omit_failed' and episode-aware frame dropping are not supported with streaming datasets."
+            )
+        shuffle = False
+        sampler = EpisodeAwareSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            episode_indices_to_use=selected_training_episodes,
+            drop_n_last_frames=drop_n_last_frames,
+            shuffle=True,
+            index_mapping=getattr(dataset, "_absolute_to_relative_idx", None),
+        )
+        sampled_num_frames = len(sampler)
+        sampled_num_episodes = (
+            len(selected_training_episodes) if selected_training_episodes is not None else dataset.num_episodes
+        )
+        logging.info(
+            (
+                "Training sampler configured: omit_failed=%s drop_n_last_frames=%d "
+                "loaded_num_frames=%d loaded_num_episodes=%d sampled_num_frames=%d sampled_num_episodes=%d"
+            ),
+            cfg.dataset.omit_failed,
+            drop_n_last_frames,
+            dataset.num_frames,
+            dataset.num_episodes,
+            sampled_num_frames,
+            sampled_num_episodes,
+        )
+        logging.debug(
+            "Training sampler episode subset (first 20): %s",
+            None if selected_training_episodes is None else selected_training_episodes[:20],
+        )
+    else:
+        shuffle = True
+        sampler = None
+        sampled_num_frames = dataset.num_frames
+        sampled_num_episodes = dataset.num_episodes
+        logging.debug(
+            "Training dataloader uses dataset-level shuffle without sampler: num_frames=%d num_episodes=%d",
+            sampled_num_frames,
+            sampled_num_episodes,
+        )
+
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
@@ -366,25 +419,18 @@ def train(
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
+        if sampled_num_frames != dataset.num_frames or sampled_num_episodes != dataset.num_episodes:
+            logging.info(
+                "Training sample subset: num_frames=%d (%s) num_episodes=%d",
+                sampled_num_frames,
+                format_big_number(sampled_num_frames),
+                sampled_num_episodes,
+            )
         num_processes = accelerator.num_processes
         effective_bs = cfg.batch_size * num_processes
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
-
-    # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -418,8 +464,8 @@ def train(
     effective_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
         effective_batch_size,
-        dataset.num_frames,
-        dataset.num_episodes,
+        sampled_num_frames,
+        sampled_num_episodes,
         train_metrics,
         initial_step=step,
         accelerator=accelerator,

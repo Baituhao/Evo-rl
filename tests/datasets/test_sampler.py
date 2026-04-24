@@ -90,3 +90,16 @@ def test_shuffle():
     assert sampler.indices == [0, 1, 2, 3, 4, 5]
     assert len(sampler) == 6
     assert set(sampler) == {0, 1, 2, 3, 4, 5}
+
+
+def test_episode_indices_to_use_with_index_mapping():
+    sampler = EpisodeAwareSampler(
+        dataset_from_indices=[0, 2, 3],
+        dataset_to_indices=[2, 3, 6],
+        episode_indices_to_use=[0, 2],
+        shuffle=False,
+        index_mapping={0: 0, 1: 1, 3: 2, 4: 3, 5: 4},
+    )
+    assert sampler.indices == [0, 1, 2, 3, 4]
+    assert len(sampler) == 5
+    assert list(sampler) == [0, 1, 2, 3, 4]

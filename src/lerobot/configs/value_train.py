@@ -19,14 +19,18 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.recording_annotations import normalize_episode_success_label
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
+from lerobot.values.value01.configuration_value01 import Value01Config
 
 VALUE_TRAIN_CONFIG_NAME = "value_train_config.json"
+SUPPORTED_VALUE_TYPES = tuple(
+    cfg_cls.get_choice_name(cfg_cls) for cfg_cls in (Pistar06Config, Value01Config)
+)
 
 
 @dataclass
 class ValueTargetsConfig:
     success_field: str = "episode_success"
-    default_success: str = "failure"
+    default_success: str = "success"
     c_fail_coef: float = 1.0
     target_field: str = "observation.value_target"
 
@@ -106,10 +110,10 @@ class ValueTrainPipelineConfig(HubMixin):
 
         if self.value is None:
             raise ValueError("Value is not configured. Please specify a value config with `--value.type`.")
-        if self.value.type != "pistar06":
+        if self.value.type not in SUPPORTED_VALUE_TYPES:
             raise ValueError(
                 f"Unsupported value type '{self.value.type}'. "
-                "Current lerobot-value-train supports only '--value.type=pistar06'."
+                f"Current lerobot-value-train supports only {SUPPORTED_VALUE_TYPES}."
             )
 
         self.targets.validate()

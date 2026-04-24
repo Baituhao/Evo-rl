@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import logging
 from unittest.mock import patch
 
 import torch
@@ -129,3 +130,31 @@ def test_without_acp_no_advantage_tag_in_pi05_tokenizer(mock_auto_tokenizer):
     assert len(prompts) == 1
     assert "Advantage:" not in prompts[0]
     assert prompts[0].startswith("Task: Pick bottle")
+
+
+def test_acp_hook_logs_positive_and_negative_debug_messages(caplog):
+    hook = build_acp_raw_batch_hook(
+        ACPConfig(
+            enable=True,
+            indicator_field="complementary_info.acp_indicator",
+            indicator_dropout_prob=0.0,
+        ),
+        seed=123,
+    )
+    batch = {
+        "task": ["Pick bottle", "Place bottle"],
+        "complementary_info.acp_indicator": torch.tensor([1, 0], dtype=torch.int64),
+        "is_expert": torch.tensor([1, 0], dtype=torch.int64),
+        "complementary_info.is_intervention": torch.tensor([0.0, 1.0], dtype=torch.float32),
+    }
+
+    with caplog.at_level(logging.DEBUG):
+        conditioned_batch = hook(batch, 7)
+
+    assert conditioned_batch["task"][0].endswith(ACP_POSITIVE_TAG)
+    assert conditioned_batch["task"][1].endswith(ACP_NEGATIVE_TAG)
+    assert "[ACP][train][step=7][sample=0]" in caplog.text
+    assert "tag=positive" in caplog.text
+    assert "tag=negative" in caplog.text
+    assert "is_expert=1" in caplog.text
+    assert "intervention=1.0" in caplog.text

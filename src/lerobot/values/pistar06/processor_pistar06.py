@@ -155,6 +155,17 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
     def _process_camera_batch(self, img_batch: Tensor) -> Tensor:
         return self._to_bchw(img_batch).detach().to(dtype=torch.float32)
 
+    @staticmethod
+    def _resize_spatial(img_batch: Tensor, target_hw: tuple[int, int]) -> Tensor:
+        if img_batch.shape[-2:] == target_hw:
+            return img_batch
+        return functional.interpolate(
+            img_batch,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+
     def _prepare_images(self, observation: dict[str, Any]) -> tuple[Tensor, Tensor]:
         present_img_keys = [key for key in self.camera_features if key in observation]
         if len(present_img_keys) == 0:
@@ -165,6 +176,8 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
 
         reference_img = self._process_camera_batch(torch.as_tensor(observation[present_img_keys[0]]))
         bsize = reference_img.shape[0]
+        reference_shape = reference_img.shape[1:]
+        reference_hw = reference_img.shape[-2:]
         image_tensors: list[Tensor] = []
         image_masks: list[Tensor] = []
 
@@ -175,11 +188,13 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
                     raise ValueError(
                         f"Mismatched batch size across cameras. Camera '{key}' has {img.shape[0]}, expected {bsize}."
                     )
-                if img.shape[1:] != reference_img.shape[1:]:
+                if img.shape[1] != reference_shape[0]:
                     raise ValueError(
-                        "Camera tensors must share the same [C,H,W] shape before model preprocessing. "
-                        f"Camera '{key}' has {tuple(img.shape[1:])}, expected {tuple(reference_img.shape[1:])}."
+                        "Camera tensors must share the same channel count before model preprocessing. "
+                        f"Camera '{key}' has {img.shape[1]} channels, expected {reference_shape[0]}."
                     )
+                # Allow mixed camera resolutions by normalizing spatial size before stacking.
+                img = self._resize_spatial(img, reference_hw)
                 image_tensors.append(img)
                 image_masks.append(torch.ones(bsize, dtype=torch.bool))
             else:

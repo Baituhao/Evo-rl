@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import random
 from collections.abc import Callable
 from typing import Any
@@ -22,6 +23,9 @@ import torch
 
 from lerobot.configs.train import ACPConfig
 from lerobot.rl.acp_tags import build_acp_tagged_task
+
+ACP_INTERVENTION_FIELD = "complementary_info.is_intervention"
+ACP_EXPERT_EPISODE_FIELD = "is_expert"
 
 
 def _extract_indicators(values: Any, batch_size: int) -> list[bool]:
@@ -44,6 +48,36 @@ def _extract_indicators(values: Any, batch_size: int) -> list[bool]:
     return [v == 1 for v in parsed]
 
 
+def _extract_optional_batch_value(batch: dict[str, Any], field_name: str, index: int) -> Any:
+    if field_name not in batch:
+        return None
+
+    values = batch[field_name]
+    if isinstance(values, torch.Tensor):
+        if values.ndim == 0:
+            return values.detach().cpu().item()
+        if values.shape[0] <= index:
+            return None
+        value = values[index]
+        if isinstance(value, torch.Tensor) and value.ndim == 0:
+            return value.detach().cpu().item()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        return value
+
+    if isinstance(values, (list, tuple)):
+        if len(values) <= index:
+            return None
+        value = values[index]
+        if isinstance(value, torch.Tensor) and value.ndim == 0:
+            return value.detach().cpu().item()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        return value
+
+    return values
+
+
 class ACPPromptHook:
     def __init__(self, cfg: ACPConfig, seed: int | None):
         self.indicator_field = cfg.indicator_field
@@ -55,7 +89,7 @@ class ACPPromptHook:
             raise KeyError(f"ACP indicator field '{self.indicator_field}' is missing from batch.")
         return _extract_indicators(batch[self.indicator_field], batch_size)
 
-    def __call__(self, batch: Any, _: int) -> Any:
+    def __call__(self, batch: Any, step: int) -> Any:
         if not isinstance(batch, dict):
             raise TypeError(f"ACP batch must be dict, got {type(batch).__name__}.")
         if "task" not in batch:
@@ -70,11 +104,37 @@ class ACPPromptHook:
         indicators = self._resolve_indicators(batch, len(tasks))
 
         conditioned_tasks: list[str] = []
-        for task, is_positive in zip(tasks, indicators, strict=True):
+        for index, (task, is_positive) in enumerate(zip(tasks, indicators, strict=True)):
+            intervention_value = _extract_optional_batch_value(batch, ACP_INTERVENTION_FIELD, index)
+            expert_value = _extract_optional_batch_value(batch, ACP_EXPERT_EPISODE_FIELD, index)
             if self.dropout > 0.0 and self.rng.random() < self.dropout:
+                logging.debug(
+                    "[ACP][train][step=%d][sample=%d] indicator=%d tag=dropout is_expert=%r intervention=%r "
+                    "original_task=%r conditioned_task=%r",
+                    step,
+                    index,
+                    int(is_positive),
+                    expert_value,
+                    intervention_value,
+                    task,
+                    task,
+                )
                 conditioned_tasks.append(task)
                 continue
-            conditioned_tasks.append(build_acp_tagged_task(task, is_positive=is_positive))
+            conditioned_task = build_acp_tagged_task(task, is_positive=is_positive)
+            logging.debug(
+                "[ACP][train][step=%d][sample=%d] indicator=%d tag=%s is_expert=%r intervention=%r "
+                "original_task=%r conditioned_task=%r",
+                step,
+                index,
+                int(is_positive),
+                "positive" if is_positive else "negative",
+                expert_value,
+                intervention_value,
+                task,
+                conditioned_task,
+            )
+            conditioned_tasks.append(conditioned_task)
         batch["task"] = conditioned_tasks
         return batch
 

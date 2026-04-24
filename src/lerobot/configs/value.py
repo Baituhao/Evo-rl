@@ -20,7 +20,7 @@ class ValueInferenceDatasetConfig:
     revision: str | None = None
     download_videos: bool = True
     success_field: str = "episode_success"
-    default_success: str = "failure"
+    default_success: str = "success"
 
     def validate(self) -> None:
         if not self.repo_id:
@@ -65,8 +65,10 @@ class ValueInferenceACPConfig:
     n_step: int = 50
     positive_ratio: float = 0.3
     force_intervention_positive: bool = True
+    force_expert_episode_positive: bool = True
 
     intervention_field: str = "complementary_info.is_intervention"
+    expert_episode_field: str = "is_expert"
     value_field: str = "complementary_info.value"
     advantage_field: str = "complementary_info.advantage"
     indicator_field: str = "complementary_info.acp_indicator"

@@ -20,6 +20,7 @@ from lerobot.values.pistar06.modeling_pistar06 import (
 from lerobot.values.pistar06.processor_pistar06 import (
     PISTAR06_IMAGE_MASK_KEY,
     PISTAR06_IMAGES_KEY,
+    Pistar06PrepareImagesProcessorStep,
     Pistar06PrepareTaskPromptProcessorStep,
     make_pistar06_pre_post_processors,
 )
@@ -187,6 +188,28 @@ def test_pistar06_processor_requires_task_field(hf_stubs):
 
     with pytest.raises(KeyError, match="Missing task field"):
         preprocessor({OBS_STATE: torch.rand(2, 12), "observation.images.front": torch.rand(2, 3, 48, 40)})
+
+
+def test_pistar06_prepare_images_resizes_mixed_camera_resolutions():
+    step = Pistar06PrepareImagesProcessorStep(
+        camera_features=[
+            "observation.images.head",
+            "observation.images.left",
+            "observation.images.right",
+        ]
+    )
+
+    images, image_attention_mask = step._prepare_images(
+        {
+            "observation.images.head": torch.rand(2, 3, 96, 128),
+            "observation.images.left": torch.rand(2, 3, 48, 64),
+            "observation.images.right": torch.rand(2, 48, 64, 3),
+        }
+    )
+
+    assert images.shape == (2, 3, 3, 96, 128)
+    assert images.dtype == torch.float32
+    assert torch.equal(image_attention_mask, torch.ones(2, 3, dtype=torch.bool))
 
 
 def test_pistar06_processor_can_disable_state_in_prompt(hf_stubs):

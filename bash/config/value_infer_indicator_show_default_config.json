@@ -1,0 +1,45 @@
+{
+    "acp": {
+        "advantage_field": "complementary_info.advantage_pistar06",
+        "c_fail_coef": 1,
+        "enable": true,
+        "force_intervention_positive": true,
+        "indicator_field": "complementary_info.acp_indicator_pistar06",
+        "intervention_field": "complementary_info.is_intervention",
+        "n_step": 50,
+        "positive_ratio": 0.3,
+        "value_field": "complementary_info.value_pistar06"
+    },
+    "dataset": {
+        "default_success": "success",
+        "download_videos": true,
+        "episodes": [10,20,23,46,51,54,57,67,70,73,86,100,106,115,143,149,179,187,194,204,214,270,283,288,306,314,316,341,376,2073, 2074, 2075, 2076, 2077, 2078, 2079, 2080, 2081, 2082],
+        "repo_id": "my/rollout",
+        "revision": null,
+        "root": null,
+        "success_field": "episode_success"
+    },
+    "inference": {
+        "checkpoint_path": null,
+        "checkpoint_ref": "last"
+    },
+    "job_name": "value_infer_my_rollout",
+    "output_dir": null,
+    "rename_map": {},
+    "runtime": {
+        "batch_size": 64,
+        "device": "cuda",
+        "num_workers": 16
+    },
+    "seed": 1000,
+    "viz": {
+        "enable": true,
+        "episodes": [10,20,23,46,51,54,57,67,70,73,86,100,106,115,143,149,179,187,194,204,214,270,283,288,306,314,316,341,376,2073, 2074, 2075, 2076, 2077, 2078, 2079, 2080, 2081, 2082],
+        "frame_storage_mode": "memory",
+        "overwrite": false,
+        "smooth_window": 1,
+        "vcodec": "libsvtav1",
+        "video_key": "observation.images.image",
+        "video_keys": null
+    }
+}

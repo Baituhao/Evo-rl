@@ -166,6 +166,15 @@ wandb/
 # Data folders
 data/
 outputs/
+outputs_oss
+datasets/
+datasets_cpfs
+datasets_oss
+datasets_shenjian
+datasets_shenjian_oss
+
+# Backup files
+*.backup
 
 # Translations
 *.mo
@@ -178,3 +187,23 @@ outputs/
 *.xml
 *.part
 AGENTS.md
+
+### AI Tool Configs ###
+.claude/
+.codex
+
+### External / Compiled ###
+# EGL probe (pre-built binary package)
+egl_probe/
+
+# Paper PDF
+paper/
+
+# Personal notes / prompts
+prompt.md
+
+### Generated Analysis Results ###
+analysis/
+
+### Bash script cache ###
+bash/.bash/

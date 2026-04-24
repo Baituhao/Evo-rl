@@ -20,6 +20,7 @@ import torch
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
@@ -27,12 +28,20 @@ from lerobot.datasets.lerobot_dataset import (
 )
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_PREFIX, REWARD
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
+
+
+def _get_visual_normalization_mode(cfg: PreTrainedConfig) -> NormalizationMode | None:
+    norm_map = getattr(cfg, "normalization_mapping", None)
+    if norm_map is None:
+        return None
+
+    return norm_map.get("VISUAL") or norm_map.get(FeatureType.VISUAL)
 
 
 def resolve_delta_timestamps(
@@ -54,19 +63,40 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    available_observation_keys = {key for key in ds_meta.features if key.startswith(OBS_PREFIX)}
+    available_visual_keys = {key for key in available_observation_keys if key.startswith(f"{OBS_IMAGES}.")}
+    available_non_visual_keys = available_observation_keys - available_visual_keys
+
+    declared_observation_keys = {key for key in (cfg.input_features or {}) if key.startswith(OBS_PREFIX)}
+    declared_visual_keys = {key for key in declared_observation_keys if key.startswith(f"{OBS_IMAGES}.")}
+    declared_non_visual_keys = declared_observation_keys - declared_visual_keys
+
+    if declared_visual_keys:
+        matched_visual_keys = declared_visual_keys & available_visual_keys
+        selected_visual_keys = matched_visual_keys or available_visual_keys
+    else:
+        selected_visual_keys = available_visual_keys
+
+    if declared_non_visual_keys:
+        matched_non_visual_keys = declared_non_visual_keys & available_non_visual_keys
+        selected_non_visual_keys = matched_non_visual_keys or available_non_visual_keys
+    else:
+        selected_non_visual_keys = available_non_visual_keys
+
+    observation_keys = selected_visual_keys | selected_non_visual_keys
+
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+        if key in observation_keys and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
     return delta_timestamps
-
 
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
@@ -125,8 +155,10 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
-    if cfg.dataset.use_imagenet_stats:
+    visual_norm_mode = _get_visual_normalization_mode(cfg.policy)
+    if cfg.dataset.use_imagenet_stats and visual_norm_mode != NormalizationMode.IDENTITY:
         for key in dataset.meta.camera_keys:
+            dataset.meta.stats.setdefault(key, {})
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 

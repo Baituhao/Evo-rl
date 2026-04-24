@@ -1,0 +1,226 @@
+{
+    "acp": {
+        "enable": false,
+        "indicator_dropout_prob": 0.0,
+        "indicator_field": "complementary_info.acp_indicator",
+        "log": false
+    },
+    "batch_size": 32,
+    "checkpoint_path": null,
+    "dataset": {
+        "episodes": null,
+        "image_transforms": {
+            "enable": true,
+            "max_num_transforms": 3,
+            "random_order": false,
+            "tfs": {
+                "affine": {
+                    "kwargs": {
+                        "degrees": [
+                            -5.0,
+                            5.0
+                        ],
+                        "translate": [
+                            0.05,
+                            0.05
+                        ]
+                    },
+                    "type": "RandomAffine",
+                    "weight": 1.0
+                },
+                "brightness": {
+                    "kwargs": {
+                        "brightness": [
+                            0.8,
+                            1.2
+                        ]
+                    },
+                    "type": "ColorJitter",
+                    "weight": 1.0
+                },
+                "contrast": {
+                    "kwargs": {
+                        "contrast": [
+                            0.8,
+                            1.2
+                        ]
+                    },
+                    "type": "ColorJitter",
+                    "weight": 1.0
+                },
+                "hue": {
+                    "kwargs": {
+                        "hue": [
+                            -0.05,
+                            0.05
+                        ]
+                    },
+                    "type": "ColorJitter",
+                    "weight": 1.0
+                },
+                "saturation": {
+                    "kwargs": {
+                        "saturation": [
+                            0.5,
+                            1.5
+                        ]
+                    },
+                    "type": "ColorJitter",
+                    "weight": 1.0
+                },
+                "sharpness": {
+                    "kwargs": {
+                        "sharpness": [
+                            0.5,
+                            1.5
+                        ]
+                    },
+                    "type": "SharpnessJitter",
+                    "weight": 1.0
+                }
+            }
+        },
+        "omit_failed": false,
+        "repo_id": "my/rollout",
+        "revision": null,
+        "root": "outputs/merge_rollout_0_20260330_203044",
+        "streaming": false,
+        "use_imagenet_stats": true,
+        "video_backend": "torchcodec"
+    },
+    "env": null,
+    "eval": {
+        "batch_size": 50,
+        "n_episodes": 50,
+        "use_async_envs": false
+    },
+    "eval_freq": 200000,
+    "job_name": "sarm",
+    "log_freq": 5,
+    "num_workers": 4,
+    "optimizer": {
+        "betas": [
+            0.9,
+            0.999
+        ],
+        "eps": 1e-08,
+        "grad_clip_norm": 10.0,
+        "lr": 5e-05,
+        "type": "adamw",
+        "weight_decay": 0.001
+    },
+    "output_dir": "outputs/test_sarm_train/sarm_train_example_20260410_171427",
+    "peft": null,
+    "policy": {
+        "annotation_mode": "single_stage",
+        "batch_size": 64,
+        "clip_batch_size": 64,
+        "dense_subtask_names": null,
+        "dense_temporal_proportions": null,
+        "device": "cuda",
+        "drop_n_last_frames": 1,
+        "dropout": 0.1,
+        "frame_gap": 30,
+        "hidden_dim": 768,
+        "image_downsample_antialias": false,
+        "image_downsample_mode": "bilinear",
+        "image_downsample_size": [480, 640],
+        "image_dim": 512,
+        "image_key": "observation.images.head",
+        "input_features": {
+            "observation.images.head": {
+                "shape": [
+                    960,
+                    1280,
+                    3
+                ],
+                "type": "VISUAL"
+            },
+            "observation.state": {
+                "shape": [
+                    16
+                ],
+                "type": "STATE"
+            }
+        },
+        "language_perturbation_probability": 0.2,
+        "license": null,
+        "max_rewind_steps": 4,
+        "max_state_dim": 32,
+        "n_obs_steps": 8,
+        "normalization_mapping": {
+            "LANGUAGE": "IDENTITY",
+            "REWARD": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "VISUAL": "IDENTITY"
+        },
+        "num_dense_stages": null,
+        "num_heads": 12,
+        "num_layers": 8,
+        "num_sparse_stages": 1,
+        "output_features": {
+            "sparse_progress": {
+                "shape": [
+                    13,
+                    1
+                ],
+                "type": "REWARD"
+            },
+            "sparse_stage": {
+                "shape": [
+                    13,
+                    1
+                ],
+                "type": "REWARD"
+            }
+        },
+        "pretrained_model_path": null,
+        "pretrained_path": null,
+        "private": null,
+        "push_to_hub": false,
+        "repo_id": null,
+        "rewind_probability": 0.8,
+        "sparse_subtask_names": [
+            "task"
+        ],
+        "sparse_temporal_proportions": [
+            1.0
+        ],
+        "stage_loss_weight": 1.0,
+        "state_key": "observation.state",
+        "tags": null,
+        "text_dim": 512,
+        "type": "sarm",
+        "use_amp": false,
+        "use_peft": false
+    },
+    "rabc_epsilon": 1e-06,
+    "rabc_head_mode": "sparse",
+    "rabc_kappa": 0.01,
+    "rabc_progress_path": null,
+    "rename_map": {},
+    "resume": false,
+    "save_checkpoint": true,
+    "save_freq": 10000,
+    "scheduler": {
+        "decay_lr": 5e-06,
+        "num_decay_steps": 50000,
+        "num_warmup_steps": 500,
+        "peak_lr": 5e-05,
+        "type": "cosine_decay_with_warmup"
+    },
+    "seed": 1000,
+    "steps": 50000,
+    "tolerance_s": 0.0001,
+    "use_policy_training_preset": true,
+    "use_rabc": false,
+    "wandb": {
+        "disable_artifact": false,
+        "enable": true,
+        "entity": null,
+        "mode": null,
+        "notes": null,
+        "project": "sarm",
+        "run_id": null
+    }
+}

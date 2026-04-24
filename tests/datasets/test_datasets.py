@@ -36,6 +36,7 @@ from lerobot.datasets.lerobot_dataset import (
     MultiLeRobotDataset,
     _encode_video_worker,
 )
+from lerobot.datasets.sampler import EpisodeAwareSampler, resolve_episode_indices_to_use
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
@@ -496,6 +497,122 @@ def test_factory(env_name, repo_id, policy_name):
         # test missing keys in delta_timestamps
         for key in delta_timestamps:
             assert key in item, f"{key}"
+
+
+def test_make_dataset_omit_failed_filters_failure_episodes_in_sampler(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    raw_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "dataset_with_episode_success",
+        features=features,
+        use_videos=False,
+    )
+
+    for episode_success in ["success", "failure", None, ""]:
+        for _ in range(2):
+            raw_dataset.add_frame(
+                {
+                    "action": np.random.randn(2).astype(np.float32),
+                    "observation.state": np.random.randn(2).astype(np.float32),
+                    "task": "debug_task",
+                }
+            )
+        raw_dataset.save_episode(extra_episode_metadata={"episode_success": episode_success})
+
+    raw_dataset.finalize()
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=raw_dataset.root,
+            omit_failed=True,
+        ),
+        policy=make_policy_config("act", push_to_hub=False),
+    )
+
+    filtered_dataset = make_dataset(cfg)
+
+    kept_episodes = resolve_episode_indices_to_use(
+        filtered_dataset.meta.episodes,
+        requested_episodes=filtered_dataset.episodes,
+        omit_failed=cfg.dataset.omit_failed,
+        repo_id=cfg.dataset.repo_id,
+    )
+    sampler = EpisodeAwareSampler(
+        filtered_dataset.meta.episodes["dataset_from_index"],
+        filtered_dataset.meta.episodes["dataset_to_index"],
+        episode_indices_to_use=kept_episodes,
+        shuffle=False,
+        index_mapping=getattr(filtered_dataset, "_absolute_to_relative_idx", None),
+    )
+
+    assert filtered_dataset.episodes is None
+    assert filtered_dataset.num_episodes == 4
+    assert filtered_dataset.num_frames == 8
+    assert kept_episodes == [0, 2, 3]
+    assert sampler.indices == [0, 1, 4, 5, 6, 7]
+
+
+def test_make_dataset_omit_failed_respects_requested_episode_subset_in_sampler(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    raw_dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "dataset_with_episode_subset_filter",
+        features=features,
+        use_videos=False,
+    )
+
+    for episode_success in ["success", "failure", None, "success"]:
+        raw_dataset.add_frame(
+            {
+                "action": np.random.randn(2).astype(np.float32),
+                "observation.state": np.random.randn(2).astype(np.float32),
+                "task": "debug_task",
+            }
+        )
+        raw_dataset.save_episode(extra_episode_metadata={"episode_success": episode_success})
+
+    raw_dataset.finalize()
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=raw_dataset.root,
+            episodes=[1, 2, 3],
+            omit_failed=True,
+        ),
+        policy=make_policy_config("act", push_to_hub=False),
+    )
+
+    filtered_dataset = make_dataset(cfg)
+
+    kept_episodes = resolve_episode_indices_to_use(
+        filtered_dataset.meta.episodes,
+        requested_episodes=filtered_dataset.episodes,
+        omit_failed=cfg.dataset.omit_failed,
+        repo_id=cfg.dataset.repo_id,
+    )
+    sampler = EpisodeAwareSampler(
+        filtered_dataset.meta.episodes["dataset_from_index"],
+        filtered_dataset.meta.episodes["dataset_to_index"],
+        episode_indices_to_use=kept_episodes,
+        shuffle=False,
+        index_mapping=getattr(filtered_dataset, "_absolute_to_relative_idx", None),
+    )
+
+    assert filtered_dataset.episodes == [1, 2, 3]
+    assert filtered_dataset.num_episodes == 3
+    assert filtered_dataset.num_frames == 3
+    assert kept_episodes == [2, 3]
+    assert sampler.indices == [1, 2]
 
 
 # TODO(alexander-soare): If you're hunting for savings on testing time, this takes about 5 seconds.

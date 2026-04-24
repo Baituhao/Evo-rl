@@ -382,11 +382,12 @@ class LeRobotDatasetMetadata:
                     chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
                     self._close_writer()
 
-            # Update the existing pandas dataframe with new row
-            episode_dict["meta/episodes/chunk_index"] = [chunk_idx]
-            episode_dict["meta/episodes/file_index"] = [file_idx]
+            # Keep column insertion order stable across all metadata flushes. PyArrow parquet
+            # writers require identical schemas, including field ordering.
             episode_dict["dataset_from_index"] = [self.latest_episode["dataset_to_index"][0]]
             episode_dict["dataset_to_index"] = [self.latest_episode["dataset_to_index"][0] + num_frames]
+            episode_dict["meta/episodes/chunk_index"] = [chunk_idx]
+            episode_dict["meta/episodes/file_index"] = [file_idx]
 
         # Add to buffer
         self.metadata_buffer.append(episode_dict)
@@ -1082,7 +1083,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             item = {**video_frames, **item}
 
         if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
+            image_keys = [cam for cam in self.meta.camera_keys if cam in item]
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
 

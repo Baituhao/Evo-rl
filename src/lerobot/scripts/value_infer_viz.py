@@ -70,10 +70,18 @@ def _select_video_keys(
     return resolved
 
 
-def _parse_episodes_arg(episodes_arg: str, total_episodes: int) -> list[int]:
-    value = episodes_arg.strip().lower()
+def _parse_episodes_arg(episodes_arg: str | None, total_episodes: int) -> list[int]:
+    # `draccus`/json may serialize `null` as None or the string "None".
+    if episodes_arg is None:
+        return list(range(total_episodes))
+    value = str(episodes_arg).strip().lower()
+    if value in {"none", "null", ""}:
+        return list(range(total_episodes))
     if value == "all":
         return list(range(total_episodes))
+
+    # Strip surrounding brackets if present (e.g. "[790, 791]" -> "790, 791")
+    episodes_arg = episodes_arg.strip().lstrip("[").rstrip("]")
 
     parsed: set[int] = set()
     for token in episodes_arg.split(","):
@@ -149,6 +157,80 @@ def _curve_points(
     return points
 
 
+def _series_styles() -> dict[str, tuple[int, int, int, int]]:
+    return {
+        "target": (80, 220, 120, 220),
+        "reward": (255, 170, 60, 220),
+        "value": (100, 200, 255, 220),
+        "advantage": (255, 110, 110, 220),
+    }
+
+
+def _draw_series_legend(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    current_step: int,
+    series_values: dict[str, np.ndarray],
+    chart_x0: int,
+    chart_y0: int,
+) -> None:
+    styles = _series_styles()
+    font = _load_font(max(12, height // 34))
+    labels = ["target", "reward", "value", "advantage"]
+    legend_rows: list[tuple[str, tuple[int, int, int, int], str]] = []
+    for label in labels:
+        values = series_values.get(label)
+        if values is None or values.shape[0] == 0:
+            continue
+        idx = min(current_step, values.shape[0] - 1)
+        legend_rows.append((label, styles[label], f"{label}: {float(values[idx]):.4f}"))
+
+    if not legend_rows:
+        return
+
+    row_gap = max(4, height // 160)
+    line_len = max(18, width // 36)
+    swatch_gap = max(8, width // 160)
+    padding_x = max(8, width // 120)
+    padding_y = max(6, height // 140)
+
+    max_text_w = 0
+    row_heights: list[int] = []
+    for _, _, text in legend_rows:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        max_text_w = max(max_text_w, bbox[2] - bbox[0])
+        row_heights.append(bbox[3] - bbox[1])
+
+    box_w = padding_x * 2 + line_len + swatch_gap + max_text_w
+    content_h = sum(row_heights) + row_gap * max(0, len(row_heights) - 1)
+    box_h = padding_y * 2 + content_h
+    box_x0 = chart_x0 + max(4, width // 240)
+    box_y0 = chart_y0 + max(4, height // 240)
+    box_x1 = min(width - 4, box_x0 + box_w)
+    box_y1 = min(height - 4, box_y0 + box_h)
+    draw.rounded_rectangle((box_x0, box_y0, box_x1, box_y1), radius=8, fill=(0, 0, 0, 150))
+
+    y = box_y0 + padding_y
+    for (label, color, text), row_h in zip(legend_rows, row_heights, strict=True):
+        cy = y + row_h // 2
+        draw.line(
+            [(box_x0 + padding_x, cy), (box_x0 + padding_x + line_len, cy)],
+            fill=color,
+            width=max(2, width // 640),
+        )
+        dot_r = max(2, width // 320)
+        dot_x = box_x0 + padding_x + line_len
+        draw.ellipse((dot_x - dot_r, cy - dot_r, dot_x + dot_r, cy + dot_r), fill=color)
+        draw.text(
+            (box_x0 + padding_x + line_len + swatch_gap, y),
+            text,
+            fill=color,
+            font=font,
+        )
+        y += row_h + row_gap
+
+
 def _draw_overlay(
     frame: Image.Image,
     values: np.ndarray,
@@ -158,10 +240,17 @@ def _draw_overlay(
     highlight_current_point: bool,
     y_min: float,
     y_max: float,
+    advantages: np.ndarray | None = None,
     indicators: np.ndarray | None = None,
+    draw_advantage_threshold_marker: bool = False,
+    advantage_threshold: float | None = None,
+    advantage_percent: float | None = None,
+    targets: np.ndarray | None = None,
+    rewards: np.ndarray | None = None,
+    draw_indicator_persistent_marker: bool = False,
+    draw_indicator_status_text: bool = False,
 ) -> Image.Image:
-    # Keep signature/call-sites stable; style does not use these signals.
-    _ = (advantage_t, acp_t, highlight_current_point, indicators)
+    _ = (advantage_t, highlight_current_point)
 
     rgba = frame.convert("RGBA")
     overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
@@ -198,31 +287,87 @@ def _draw_overlay(
     cx = int(round(chart_x0 + chart_w * (last / denom_x)))
     draw.line([(cx, chart_y0), (cx, chart_y1)], fill=(255, 255, 255, 40), width=1)
 
-    points = _curve_points(
-        values=values,
-        current_step=last,
-        x0=chart_x0,
-        y0=chart_y0,
-        width=chart_w,
-        height=chart_h,
-        y_min=val_min,
-        y_max=val_max,
-    )
-
     curve_width = max(2, width // 600)
-    if len(points) >= 2:
-        draw.line(points, fill=(100, 200, 255, 220), width=curve_width)
+    threshold_marker_color = (214, 132, 132, 72)
+    styles = _series_styles()
+    series_values: dict[str, np.ndarray] = {"value": values}
+    if targets is not None:
+        series_values["target"] = targets
+    if rewards is not None:
+        series_values["reward"] = rewards
+    if advantages is not None:
+        series_values["advantage"] = advantages
 
-    if len(points) >= 1:
+    series_points: dict[str, list[tuple[int, int]]] = {}
+    for label in ["target", "reward", "value", "advantage"]:
+        series = series_values.get(label)
+        if series is None or series.shape[0] == 0:
+            continue
+        points = _curve_points(
+            values=series,
+            current_step=last,
+            x0=chart_x0,
+            y0=chart_y0,
+            width=chart_w,
+            height=chart_h,
+            y_min=val_min,
+            y_max=val_max,
+        )
+        series_points[label] = points
+        if len(points) >= 2:
+            draw.line(points, fill=styles[label], width=curve_width)
+
+    if (
+        draw_advantage_threshold_marker
+        and advantage_threshold is not None
+        and advantages is not None
+        and len(series_points.get("advantage", [])) >= 1
+    ):
+        marker_segments_by_x: dict[int, int] = {}
+        advantage_points = series_points["advantage"]
+        last_advantage_idx = min(last, len(advantages) - 1, len(advantage_points) - 1)
+        for step_idx in range(last_advantage_idx + 1):
+            if float(advantages[step_idx]) <= float(advantage_threshold):
+                continue
+            px, py = advantage_points[step_idx]
+            if px not in marker_segments_by_x or py > marker_segments_by_x[px]:
+                marker_segments_by_x[px] = py
+
+        marker_width = max(1, curve_width - 1)
+        for px, py in marker_segments_by_x.items():
+            draw.line([(px, py), (px, height - 1)], fill=threshold_marker_color, width=marker_width)
+
+    if draw_indicator_persistent_marker and indicators is not None and len(series_points.get("advantage", [])) >= 1:
+        marker_segments_by_x: dict[int, int] = {}
+        advantage_points = series_points["advantage"]
+        last_advantage_idx = min(last, len(indicators) - 1, len(advantage_points) - 1)
+        for step_idx in range(last_advantage_idx + 1):
+            if int(indicators[step_idx]) != 1:
+                continue
+            px, py = advantage_points[step_idx]
+            if px not in marker_segments_by_x or py > marker_segments_by_x[px]:
+                marker_segments_by_x[px] = py
+
+        marker_width = max(1, curve_width - 1)
+        indicator_marker_color = (214, 60, 60, 72)
+        for px, py in marker_segments_by_x.items():
+            draw.line([(px, py), (px, height - 1)], fill=indicator_marker_color, width=marker_width)
+
+    for label, points in series_points.items():
+        if len(points) == 0:
+            continue
         px, py = points[-1]
-        radius = max(4, curve_width + 2)
-        draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=(255, 255, 100, 255))
+        color = styles[label]
+        radius = max(3, curve_width + (1 if label == "value" else 0))
+        draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=color)
         draw.ellipse(
-            (px - radius - 2, py - radius - 2, px + radius + 2, py + radius + 2),
-            outline=(255, 255, 100, 180),
+            (px - radius - 1, py - radius - 1, px + radius + 1, py + radius + 1),
+            outline=(255, 255, 255, 180 if label == "value" else 110),
             width=1,
         )
 
+    if len(series_points) == 1 and len(series_points.get("value", [])) >= 1:
+        px, py = series_points["value"][-1]
         value_font = _load_font(max(16, height // 22))
         value_text = f"{float(values[last]):.4f}"
         value_bbox = draw.textbbox((0, 0), value_text, font=value_font)
@@ -231,7 +376,17 @@ def _draw_overlay(
         tx = min(px + 10, width - text_w - 10)
         ty = max(py - text_h - 12, chart_y0 + 2)
         draw.rectangle((tx - 4, ty - 2, tx + text_w + 4, ty + text_h + 2), fill=(0, 0, 0, 160))
-        draw.text((tx, ty), value_text, fill=(255, 255, 100, 255), font=value_font)
+        draw.text((tx, ty), value_text, fill=styles["value"], font=value_font)
+
+    _draw_series_legend(
+        draw=draw,
+        width=width,
+        height=height,
+        current_step=last,
+        series_values=series_values,
+        chart_x0=chart_x0,
+        chart_y0=chart_y0,
+    )
 
     small_font = _load_font(max(13, height // 30))
     frame_text = f"frame {last}/{n - 1}"
@@ -242,6 +397,27 @@ def _draw_overlay(
     fy = height - frame_h - 6
     draw.rectangle((fx - 3, fy - 1, fx + frame_w + 3, fy + frame_h + 1), fill=(0, 0, 0, 140))
     draw.text((fx, fy), frame_text, fill=(200, 200, 200, 220), font=small_font)
+
+    if draw_advantage_threshold_marker and advantage_percent is not None:
+        adv_text = f"adv_percent={advantage_percent:.2f}%"
+        adv_bbox = draw.textbbox((0, 0), adv_text, font=small_font)
+        adv_w = adv_bbox[2] - adv_bbox[0]
+        adv_h = adv_bbox[3] - adv_bbox[1]
+        ax = width - adv_w - margin_x - 4
+        ay = fy - adv_h - 8
+        draw.rectangle((ax - 3, ay - 1, ax + adv_w + 3, ay + adv_h + 1), fill=(0, 0, 0, 140))
+        draw.text((ax, ay), adv_text, fill=(255, 120, 120, 235), font=small_font)
+
+    if draw_indicator_status_text:
+        indicator_text = "positive" if int(acp_t) == 1 else "negative"
+        indicator_fill = (220, 30, 30, 235) if int(acp_t) == 1 else (0, 0, 0, 235)
+        indicator_bbox = draw.textbbox((0, 0), indicator_text, font=small_font)
+        indicator_w = indicator_bbox[2] - indicator_bbox[0]
+        indicator_h = indicator_bbox[3] - indicator_bbox[1]
+        ix = width - indicator_w - margin_x - 4
+        iy = chart_y0 + 6
+        draw.rectangle((ix - 4, iy - 2, ix + indicator_w + 4, iy + indicator_h + 2), fill=(255, 255, 255, 170))
+        draw.text((ix, iy), indicator_text, fill=indicator_fill, font=small_font)
 
     return Image.alpha_composite(rgba, overlay).convert("RGB")
 
@@ -295,6 +471,41 @@ def _decode_frames_at_timestamps(
     return [Image.fromarray(np_frames[i]) for i in range(np_frames.shape[0])]
 
 
+def _is_image_dtype(dataset: LeRobotDataset, cam_key: str) -> bool:
+    """Return True if cam_key is stored as image (PNG bytes in parquet), not as a video file."""
+    features = dataset.meta.features
+    return features.get(cam_key, {}).get("dtype") == "image"
+
+
+def _load_image_frames_from_parquet(
+    raw_dataset,
+    cam_key: str,
+    ep_positions: np.ndarray,
+) -> list[Image.Image]:
+    """Load PIL frames for a given episode directly from parquet image columns."""
+    import io
+
+    col_values = raw_dataset[cam_key]
+    frames: list[Image.Image] = []
+    for idx in ep_positions:
+        entry = col_values[int(idx)]
+        # `datasets` may either return raw bytes/dicts (parquet-encoded) or already-decoded PIL images
+        # depending on the dataset feature configuration and formatting.
+        if isinstance(entry, Image.Image):
+            frames.append(entry.convert("RGB"))
+        elif isinstance(entry, dict):
+            img_bytes = entry.get("bytes")
+            if img_bytes is None:
+                raise ValueError(f"Missing 'bytes' in dict image entry for key={cam_key}")
+        elif isinstance(entry, bytes):
+            img_bytes = entry
+        else:
+            raise TypeError(f"Unexpected image column type: {type(entry)}")
+        if not isinstance(entry, Image.Image):
+            frames.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+    return frames
+
+
 def _get_episode_video_time_bounds(
     dataset: LeRobotDataset,
     episode_index: int,
@@ -338,10 +549,26 @@ def _get_video_encode_options(vcodec: str) -> tuple[dict[str, str], str]:
     return {"g": "2", "crf": "30"}, "yuv420p"
 
 
-def _get_episode_value_bounds(ep_values: np.ndarray) -> tuple[float, float]:
-    if ep_values.shape[0] == 0:
-        raise ValueError("Cannot determine value bounds from an empty episode.")
-    return float(np.min(ep_values)), float(np.max(ep_values))
+def _get_episode_value_bounds(*series_arrays: np.ndarray | None) -> tuple[float, float]:
+    valid_arrays = []
+    for arr in series_arrays:
+        if arr is None or arr.shape[0] == 0:
+            continue
+        finite = arr[np.isfinite(arr)]
+        if finite.shape[0] > 0:
+            valid_arrays.append(finite)
+
+    if not valid_arrays:
+        raise ValueError("Cannot determine value bounds from empty series.")
+
+    merged = np.concatenate(valid_arrays, axis=0)
+    y_min = float(np.min(merged))
+    y_max = float(np.max(merged))
+    if abs(y_max - y_min) < 1e-6:
+        pad = max(1e-3, abs(y_max) * 0.05, 0.01)
+        y_min -= pad
+        y_max += pad
+    return y_min, y_max
 
 
 def _encode_pil_to_video(
@@ -370,8 +597,10 @@ def _encode_pil_to_video(
 
 
 def _export_single_episode(
-    src_video_path: Path,
+    src_video_path: Path | None,
     dst_video_path: Path,
+    ep_targets: np.ndarray | None,
+    ep_rewards: np.ndarray | None,
     ep_values: np.ndarray,
     ep_advantages: np.ndarray,
     ep_indicators: np.ndarray,
@@ -383,19 +612,34 @@ def _export_single_episode(
     frame_storage_mode: str = "memory",
     temp_dir_root: Path | None = None,
     smooth_window: int = 1,
+    preloaded_frames: list[Image.Image] | None = None,
+    draw_advantage_threshold_marker: bool = False,
+    advantage_threshold: float | None = None,
+    draw_indicator_persistent_marker: bool = False,
+    draw_indicator_status_text: bool = False,
 ) -> Path:
+    if ep_targets is not None:
+        ep_targets = _smooth_1d(ep_targets, smooth_window)
+    if ep_rewards is not None:
+        ep_rewards = _smooth_1d(ep_rewards, smooth_window)
     ep_values = _smooth_1d(ep_values, smooth_window)
     ep_advantages = _smooth_1d(ep_advantages, smooth_window)
-    y_min, y_max = _get_episode_value_bounds(ep_values)
-    decoded_frames = _decode_frames_at_timestamps(
-        video_file=src_video_path,
-        timestamps_s=episode_timestamps_s,
-        tolerance_s=tolerance_s,
-        backend=video_backend,
-    )
+    advantage_percent: float | None = None
+    if draw_advantage_threshold_marker and advantage_threshold is not None:
+        advantage_percent = float(np.mean(ep_advantages > float(advantage_threshold)) * 100.0)
+    y_min, y_max = _get_episode_value_bounds(ep_targets, ep_rewards, ep_values, ep_advantages)
+    if preloaded_frames is not None:
+        decoded_frames = preloaded_frames
+    else:
+        decoded_frames = _decode_frames_at_timestamps(
+            video_file=src_video_path,
+            timestamps_s=episode_timestamps_s,
+            tolerance_s=tolerance_s,
+            backend=video_backend,
+        )
     n_frames = min(len(decoded_frames), len(ep_values))
     if n_frames == 0:
-        raise ValueError(f"No decoded frames for video: {src_video_path}")
+        raise ValueError(f"No decoded frames for episode: {dst_video_path.stem}")
 
     if frame_storage_mode == "disk":
         with tempfile.TemporaryDirectory(
@@ -414,7 +658,15 @@ def _export_single_episode(
                     highlight_current_point=(int(ep_indicators[i]) == 1),
                     y_min=y_min,
                     y_max=y_max,
+                    advantages=ep_advantages,
                     indicators=ep_indicators,
+                    draw_advantage_threshold_marker=draw_advantage_threshold_marker,
+                    advantage_threshold=advantage_threshold,
+                    advantage_percent=advantage_percent,
+                    targets=ep_targets,
+                    rewards=ep_rewards,
+                    draw_indicator_persistent_marker=draw_indicator_persistent_marker,
+                    draw_indicator_status_text=draw_indicator_status_text,
                 )
                 composed.save(temp_path / f"frame-{i:06d}.png")
 
@@ -438,7 +690,15 @@ def _export_single_episode(
             highlight_current_point=(int(ep_indicators[i]) == 1),
             y_min=y_min,
             y_max=y_max,
+            advantages=ep_advantages,
             indicators=ep_indicators,
+            draw_advantage_threshold_marker=draw_advantage_threshold_marker,
+            advantage_threshold=advantage_threshold,
+            advantage_percent=advantage_percent,
+            targets=ep_targets,
+            rewards=ep_rewards,
+            draw_indicator_persistent_marker=draw_indicator_persistent_marker,
+            draw_indicator_status_text=draw_indicator_status_text,
         )
         composed_frames.append(composed)
 
@@ -447,9 +707,11 @@ def _export_single_episode(
 
 
 def _export_single_episode_multiview(
-    src_video_paths: list[Path],
+    src_video_paths: list[Path | None],
     camera_labels: list[str],
     dst_video_path: Path,
+    ep_targets: np.ndarray | None,
+    ep_rewards: np.ndarray | None,
     ep_values: np.ndarray,
     ep_advantages: np.ndarray,
     ep_indicators: np.ndarray,
@@ -461,20 +723,35 @@ def _export_single_episode_multiview(
     frame_storage_mode: str = "memory",
     temp_dir_root: Path | None = None,
     smooth_window: int = 1,
+    preloaded_frames_per_cam: list[list[Image.Image]] | None = None,
+    draw_advantage_threshold_marker: bool = False,
+    advantage_threshold: float | None = None,
+    draw_indicator_persistent_marker: bool = False,
+    draw_indicator_status_text: bool = False,
 ) -> Path:
+    if ep_targets is not None:
+        ep_targets = _smooth_1d(ep_targets, smooth_window)
+    if ep_rewards is not None:
+        ep_rewards = _smooth_1d(ep_rewards, smooth_window)
     ep_values = _smooth_1d(ep_values, smooth_window)
     ep_advantages = _smooth_1d(ep_advantages, smooth_window)
-    y_min, y_max = _get_episode_value_bounds(ep_values)
+    advantage_percent: float | None = None
+    if draw_advantage_threshold_marker and advantage_threshold is not None:
+        advantage_percent = float(np.mean(ep_advantages > float(advantage_threshold)) * 100.0)
+    y_min, y_max = _get_episode_value_bounds(ep_targets, ep_rewards, ep_values, ep_advantages)
 
     all_cam_frames: list[list[Image.Image]] = []
-    for src_path, ts in zip(src_video_paths, episode_timestamps_per_cam, strict=True):
-        frames = _decode_frames_at_timestamps(
-            video_file=src_path,
-            timestamps_s=ts,
-            tolerance_s=tolerance_s,
-            backend=video_backend,
-        )
-        all_cam_frames.append(frames)
+    if preloaded_frames_per_cam is not None:
+        all_cam_frames = preloaded_frames_per_cam
+    else:
+        for src_path, ts in zip(src_video_paths, episode_timestamps_per_cam, strict=True):
+            frames = _decode_frames_at_timestamps(
+                video_file=src_path,
+                timestamps_s=ts,
+                tolerance_s=tolerance_s,
+                backend=video_backend,
+            )
+            all_cam_frames.append(frames)
 
     n_frames = min(len(f) for f in all_cam_frames)
     n_frames = min(n_frames, len(ep_values))
@@ -515,7 +792,15 @@ def _export_single_episode_multiview(
             highlight_current_point=False,
             y_min=y_min,
             y_max=y_max,
+            advantages=ep_advantages,
             indicators=ep_indicators,
+            draw_advantage_threshold_marker=draw_advantage_threshold_marker,
+            advantage_threshold=advantage_threshold,
+            advantage_percent=advantage_percent,
+            targets=ep_targets,
+            rewards=ep_rewards,
+            draw_indicator_persistent_marker=draw_indicator_persistent_marker,
+            draw_indicator_status_text=draw_indicator_status_text,
         )
 
     if frame_storage_mode == "disk":
@@ -557,6 +842,12 @@ def _export_overlay_videos(
     vcodec: str,
     frame_storage_mode: str = "memory",
     smooth_window: int = 1,
+    draw_advantage_threshold_marker: bool = False,
+    advantage_threshold: float | None = None,
+    draw_indicator_persistent_marker: bool = False,
+    draw_indicator_status_text: bool = False,
+    target_field: str | None = None,
+    reward_field: str | None = None,
 ) -> list[Path]:
     selected_video_keys = _select_video_keys(
         camera_keys=list(dataset.meta.camera_keys),
@@ -571,10 +862,29 @@ def _export_overlay_videos(
     if value_field not in column_names:
         raise KeyError(f"Missing value field '{value_field}' in dataset.")
 
+    if draw_advantage_threshold_marker and advantage_threshold is None:
+        raise ValueError(
+            "advantage_threshold must be provided when draw_advantage_threshold_marker is enabled."
+        )
+
     values_all = _to_1d_float(raw_dataset[value_field])
+    if target_field is not None:
+        if target_field not in column_names:
+            raise KeyError(f"Missing target field '{target_field}' in dataset.")
+        targets_all: np.ndarray | None = _to_1d_float(raw_dataset[target_field])
+    else:
+        targets_all = None
+    if reward_field is not None:
+        if reward_field not in column_names:
+            raise KeyError(f"Missing reward field '{reward_field}' in dataset.")
+        rewards_all: np.ndarray | None = _to_1d_float(raw_dataset[reward_field])
+    else:
+        rewards_all = None
     if advantage_field in column_names:
         advantages_all = _to_1d_float(raw_dataset[advantage_field])
     else:
+        if draw_advantage_threshold_marker:
+            raise KeyError(f"Missing advantage field '{advantage_field}' in dataset.")
         advantages_all = np.zeros_like(values_all, dtype=np.float32)
 
     if indicator_field in column_names:
@@ -623,16 +933,37 @@ def _export_overlay_videos(
                 continue
 
             ep_timestamps = timestamps_all[ep_positions]
-            src_paths: list[Path] = []
+            src_paths: list[Path | None] = []
             ts_per_cam: list[np.ndarray] = []
+            preloaded_per_cam: list[list[Image.Image] | None] = []
             for cam_key in selected_video_keys:
-                src_path = Path(dataset.root) / dataset.meta.get_video_file_path(ep, cam_key)
-                src_paths.append(src_path)
-                from_ts, to_ts = _get_episode_video_time_bounds(dataset, ep, cam_key)
-                cam_ts = from_ts + ep_timestamps
-                if to_ts is not None:
-                    cam_ts = np.minimum(cam_ts, to_ts)
-                ts_per_cam.append(cam_ts)
+                if _is_image_dtype(dataset, cam_key):
+                    src_paths.append(None)
+                    ts_per_cam.append(ep_timestamps)
+                    preloaded_per_cam.append(
+                        _load_image_frames_from_parquet(raw_dataset, cam_key, ep_positions)
+                    )
+                else:
+                    src_path = Path(dataset.root) / dataset.meta.get_video_file_path(ep, cam_key)
+                    src_paths.append(src_path)
+                    from_ts, to_ts = _get_episode_video_time_bounds(dataset, ep, cam_key)
+                    cam_ts = from_ts + ep_timestamps
+                    if to_ts is not None:
+                        cam_ts = np.minimum(cam_ts, to_ts)
+                    ts_per_cam.append(cam_ts)
+                    preloaded_per_cam.append(None)
+
+            has_any_preloaded = any(f is not None for f in preloaded_per_cam)
+            resolved_preloaded: list[list[Image.Image]] | None = None
+            if has_any_preloaded:
+                resolved_preloaded = []
+                for frames, src_path, ts in zip(preloaded_per_cam, src_paths, ts_per_cam):
+                    if frames is not None:
+                        resolved_preloaded.append(frames)
+                    else:
+                        resolved_preloaded.append(
+                            _decode_frames_at_timestamps(src_path, ts, tolerance_s, video_backend)
+                        )
 
             dst_path = _build_output_video_path_multiview(
                 output_dir=output_dir,
@@ -647,15 +978,18 @@ def _export_overlay_videos(
                 (
                     src_paths,
                     dst_path,
+                    None if targets_all is None else targets_all[ep_positions],
+                    None if rewards_all is None else rewards_all[ep_positions],
                     ep_values,
                     advantages_all[ep_positions],
                     indicators_all[ep_positions],
                     ts_per_cam,
+                    resolved_preloaded,
                 )
             )
 
         desc_keys = ",".join(key.split(".")[-1] for key in selected_video_keys)
-        for srcs, dst, vals, advs, inds, ts_per_cam in tqdm(
+        for srcs, dst, tgts, rwds, vals, advs, inds, ts_per_cam, preloaded in tqdm(
             tasks,
             total=len(tasks),
             desc=f"Export overlay multiview [{desc_keys}]",
@@ -666,6 +1000,8 @@ def _export_overlay_videos(
                     src_video_paths=srcs,
                     camera_labels=selected_video_keys,
                     dst_video_path=dst,
+                    ep_targets=tgts,
+                    ep_rewards=rwds,
                     ep_values=vals,
                     ep_advantages=advs,
                     ep_indicators=inds,
@@ -677,10 +1013,16 @@ def _export_overlay_videos(
                     frame_storage_mode=frame_storage_mode,
                     temp_dir_root=output_dir,
                     smooth_window=smooth_window,
+                    preloaded_frames_per_cam=preloaded,
+                    draw_advantage_threshold_marker=draw_advantage_threshold_marker,
+                    advantage_threshold=advantage_threshold,
+                    draw_indicator_persistent_marker=draw_indicator_persistent_marker,
+                    draw_indicator_status_text=draw_indicator_status_text,
                 )
             )
     else:
         selected_video_key = selected_video_keys[0]
+        use_image_dtype = _is_image_dtype(dataset, selected_video_key)
         tasks = []
         for ep in episodes:
             ep_positions = np.flatnonzero(episode_indices_all == ep)
@@ -694,28 +1036,47 @@ def _export_overlay_videos(
                 continue
 
             ep_timestamps = timestamps_all[ep_positions]
-            from_ts, to_ts = _get_episode_video_time_bounds(dataset, ep, selected_video_key)
-            ep_video_timestamps = from_ts + ep_timestamps
-            if to_ts is not None:
-                ep_video_timestamps = np.minimum(ep_video_timestamps, to_ts)
 
             dst_path = _build_output_video_path(output_dir, dataset.repo_id, selected_video_key, ep)
             if dst_path.exists() and not overwrite:
                 continue
 
-            src_path = Path(dataset.root) / dataset.meta.get_video_file_path(ep, selected_video_key)
-            tasks.append(
-                (
-                    src_path,
-                    dst_path,
-                    ep_values,
-                    advantages_all[ep_positions],
-                    indicators_all[ep_positions],
-                    ep_video_timestamps,
+            if use_image_dtype:
+                preloaded_frames = _load_image_frames_from_parquet(raw_dataset, selected_video_key, ep_positions)
+                tasks.append(
+                    (
+                        None,
+                        dst_path,
+                        None if targets_all is None else targets_all[ep_positions],
+                        None if rewards_all is None else rewards_all[ep_positions],
+                        ep_values,
+                        advantages_all[ep_positions],
+                        indicators_all[ep_positions],
+                        ep_timestamps,
+                        preloaded_frames,
+                    )
                 )
-            )
+            else:
+                from_ts, to_ts = _get_episode_video_time_bounds(dataset, ep, selected_video_key)
+                ep_video_timestamps = from_ts + ep_timestamps
+                if to_ts is not None:
+                    ep_video_timestamps = np.minimum(ep_video_timestamps, to_ts)
+                src_path = Path(dataset.root) / dataset.meta.get_video_file_path(ep, selected_video_key)
+                tasks.append(
+                    (
+                        src_path,
+                        dst_path,
+                        None if targets_all is None else targets_all[ep_positions],
+                        None if rewards_all is None else rewards_all[ep_positions],
+                        ep_values,
+                        advantages_all[ep_positions],
+                        indicators_all[ep_positions],
+                        ep_video_timestamps,
+                        None,
+                    )
+                )
 
-        for src, dst, vals, advs, inds, ts in tqdm(
+        for src, dst, tgts, rwds, vals, advs, inds, ts, preloaded in tqdm(
             tasks,
             total=len(tasks),
             desc=f"Export overlay [{selected_video_key}]",
@@ -725,6 +1086,8 @@ def _export_overlay_videos(
                 _export_single_episode(
                     src,
                     dst,
+                    tgts,
+                    rwds,
                     vals,
                     advs,
                     inds,
@@ -736,6 +1099,11 @@ def _export_overlay_videos(
                     frame_storage_mode,
                     output_dir,
                     smooth_window=smooth_window,
+                    preloaded_frames=preloaded,
+                    draw_advantage_threshold_marker=draw_advantage_threshold_marker,
+                    advantage_threshold=advantage_threshold,
+                    draw_indicator_persistent_marker=draw_indicator_persistent_marker,
+                    draw_indicator_status_text=draw_indicator_status_text,
                 )
             )
 

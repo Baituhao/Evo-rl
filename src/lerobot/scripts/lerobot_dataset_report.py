@@ -65,9 +65,22 @@ def _to_float(value: Any) -> float:
 def _normalize_label(value: Any) -> str:
     if value is None:
         return "unlabeled"
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        value = value.item()
+    if isinstance(value, bool):
+        return "success" if value else "failure"
+    if isinstance(value, int):
+        if value == 1:
+            return "success"
+        if value == 0:
+            return "failure"
     label = str(value).strip().lower()
     if label == "":
         return "unlabeled"
+    if label in {"true", "1"}:
+        return "success"
+    if label in {"false", "0"}:
+        return "failure"
     return label
 
 

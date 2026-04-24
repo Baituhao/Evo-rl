@@ -132,7 +132,22 @@ def load_nested_dataset(
         table = arrow_dataset.to_table(filter=filter_expr)
 
         if features is not None:
-            table = table.cast(features.arrow_schema)
+            schema = features.arrow_schema
+            # PyArrow Table.cast(schema) can be strict about field order depending on versions.
+            # Some datasets store the same fields but in a different physical column order.
+            # Align the table's columns to the target schema order before casting.
+            schema_names = list(schema.names)
+            table_names = list(table.schema.names)
+            if table_names != schema_names:
+                missing = [name for name in schema_names if name not in table_names]
+                if missing:
+                    raise ValueError(
+                        "Target schema's field names are not matching the table's field names. "
+                        f"Missing fields in table: {missing}. "
+                        f"schema={schema_names} table={table_names}"
+                    )
+                table = table.select(schema_names)
+            table = table.cast(schema)
 
         return Dataset(table)
 
@@ -390,6 +405,54 @@ def load_episodes(local_dir: Path) -> datasets.Dataset:
     # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
     # This is to speedup access to these data, instead of having to load episode stats.
     episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
+
+    if len(episodes) == 0 or "tasks" not in episodes.column_names:
+        return episodes
+
+    sample_tasks = episodes[: min(len(episodes), 32)]["tasks"]
+    uses_task_indices = False
+    for task_entry in sample_tasks:
+        if isinstance(task_entry, np.ndarray):
+            task_entry = task_entry.tolist()
+        if not task_entry:
+            continue
+        first_task = task_entry[0] if isinstance(task_entry, list) else task_entry
+        uses_task_indices = isinstance(first_task, (int, np.integer))
+        break
+
+    if not uses_task_indices:
+        return episodes
+
+    task_names = load_tasks(local_dir).index.to_list()
+    logging.warning(
+        "Episode metadata at %s stores tasks as indices; normalizing them to task names during load.",
+        local_dir,
+    )
+
+    def normalize_episode_tasks(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        normalized_tasks: list[list[str]] = []
+        for task_entry in batch["tasks"]:
+            raw_tasks = task_entry.tolist() if isinstance(task_entry, np.ndarray) else task_entry
+            if not isinstance(raw_tasks, list):
+                raw_tasks = [raw_tasks]
+
+            names: list[str] = []
+            for task_value in raw_tasks:
+                if isinstance(task_value, (int, np.integer)):
+                    task_idx = int(task_value)
+                    if task_idx < 0 or task_idx >= len(task_names):
+                        raise IndexError(
+                            f"Episode task index {task_idx} out of range for {local_dir / DEFAULT_TASKS_PATH}."
+                        )
+                    names.append(task_names[task_idx])
+                else:
+                    names.append(task_value)
+            normalized_tasks.append(names)
+
+        batch["tasks"] = normalized_tasks
+        return batch
+
+    episodes = episodes.map(normalize_episode_tasks, batched=True, load_from_cache_file=False)
     return episodes
 
 

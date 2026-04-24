@@ -88,6 +88,9 @@ class SARMConfig(PreTrainedConfig):
     pretrained_model_path: str | None = None
     device: str | None = None
     image_key: str = OBS_IMAGES + ".top"  # Key for image used from the dataset
+    image_downsample_size: tuple[int, int] | None = None  # Optional (height, width) resize before CLIP encoding
+    image_downsample_mode: str = "bilinear"
+    image_downsample_antialias: bool = True
     state_key: str = OBS_STATE
 
     # Populated by the processor (video_features, state_features, text_features)
@@ -116,6 +119,20 @@ class SARMConfig(PreTrainedConfig):
         if self.annotation_mode not in ["single_stage", "dense_only", "dual"]:
             raise ValueError(
                 f"annotation_mode must be 'single_stage', 'dense_only', or 'dual', got {self.annotation_mode}"
+            )
+        if self.image_downsample_size is not None:
+            if len(self.image_downsample_size) != 2:
+                raise ValueError("image_downsample_size must be a tuple of (height, width)")
+            height, width = self.image_downsample_size
+            if height <= 0 or width <= 0:
+                raise ValueError(
+                    f"image_downsample_size must contain positive integers, got {self.image_downsample_size}"
+                )
+        valid_resize_modes = {"nearest", "nearest-exact", "bilinear", "bicubic", "area"}
+        if self.image_downsample_mode not in valid_resize_modes:
+            raise ValueError(
+                f"image_downsample_mode must be one of {sorted(valid_resize_modes)}, "
+                f"got {self.image_downsample_mode}"
             )
 
         if self.annotation_mode == "single_stage":
