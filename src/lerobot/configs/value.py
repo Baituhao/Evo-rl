@@ -78,6 +78,9 @@ class ValueInferenceACPConfig:
 
     c_fail_coef: float = 1.0
 
+    write_mode: str = "sidecar"
+    sidecar_subdir: str | None = None
+
     def validate(self) -> None:
         if self.n_step <= 0:
             raise ValueError("'acp.n_step' must be > 0.")
@@ -91,6 +94,8 @@ class ValueInferenceACPConfig:
             raise ValueError(
                 "'acp.advantage_field' and 'acp.indicator_field' must be non-empty when 'acp.enable=true'."
             )
+        if self.write_mode not in {"sidecar", "in_place"}:
+            raise ValueError("'acp.write_mode' must be 'sidecar' or 'in_place'.")
 
 
 @dataclass

@@ -40,6 +40,9 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    # Load advantage/value/indicator columns from sidecar parquet (<root>/advantage/*/frames.parquet)
+    # instead of main data parquet. Default True to avoid polluting main data during value inference.
+    advantage_sidecar: bool = True
 
 
 @dataclass

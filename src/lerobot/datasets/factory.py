@@ -142,8 +142,14 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
+                advantage_sidecar=cfg.dataset.advantage_sidecar,
             )
         else:
+            if cfg.dataset.advantage_sidecar:
+                raise NotImplementedError(
+                    "advantage_sidecar is only supported for non-streaming datasets. "
+                    "Set cfg.dataset.streaming=False or cfg.dataset.advantage_sidecar=False."
+                )
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,

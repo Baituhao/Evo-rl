@@ -453,6 +453,62 @@ def _update_feature_metadata(dataset_root: Path, feature_infos: dict[str, dict[s
     write_info(info, dataset_root)
 
 
+def _write_columns_sidecar(
+    dataset_root: Path,
+    sidecar_subdir: str,
+    absolute_indices: np.ndarray,
+    columns: dict[str, np.ndarray],
+    feature_infos: dict[str, dict[str, Any]],
+) -> None:
+    """Write value columns to a separate sidecar parquet file keyed by index.
+
+    Args:
+        dataset_root: Root directory of the dataset
+        sidecar_subdir: Subdirectory name under <root>/advantage/ (e.g., tag name)
+        absolute_indices: Global frame indices (from dataset["index"])
+        columns: Dict of column_name -> values array (aligned with absolute_indices)
+        feature_infos: Dict of column_name -> {"dtype": ..., "shape": ..., "names": ...}
+    """
+    if absolute_indices.ndim != 1:
+        raise ValueError("'absolute_indices' must be rank-1.")
+    if len(absolute_indices) == 0:
+        raise ValueError("'absolute_indices' must be non-empty.")
+
+    # Build PyArrow table with index column + data columns
+    arrays = {"index": pa.array(absolute_indices, type=pa.int64())}
+
+    for field_name, values in columns.items():
+        ftype = feature_infos[field_name]["dtype"]
+        if ftype == "float32":
+            pa_type = pa.float32()
+            arr = values.astype(np.float32, copy=False)
+        elif ftype == "int64":
+            pa_type = pa.int64()
+            arr = values.astype(np.int64, copy=False)
+        else:
+            raise ValueError(f"Unsupported sidecar dtype '{ftype}' for field '{field_name}'.")
+        arrays[field_name] = pa.array(arr, type=pa_type)
+
+    table = pa.Table.from_pydict(arrays)
+
+    # Write atomically: write to .tmp then rename
+    output_dir = dataset_root / "advantage" / sidecar_subdir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "frames.parquet"
+    tmp_path = output_dir / "frames.parquet.tmp"
+
+    pq.write_table(table, tmp_path, compression="snappy")
+    import os
+    os.replace(tmp_path, output_path)
+
+    logging.info(
+        "Wrote %d rows to sidecar parquet: %s (columns: %s)",
+        len(absolute_indices),
+        output_path,
+        list(columns.keys()),
+    )
+
+
 def _write_columns_in_place(
     dataset_root: Path,
     absolute_indices: np.ndarray,
@@ -895,14 +951,34 @@ def run_value_inference_pipeline(
             feature_infos[cfg.acp.advantage_field] = {"dtype": "float32", "shape": (1,), "names": None}
             feature_infos[cfg.acp.indicator_field] = {"dtype": "int64", "shape": (1,), "names": None}
 
-        _write_columns_in_place(
-            dataset_root=Path(dataset.root),
-            absolute_indices=absolute_indices,
-            columns=columns,
-            feature_infos=feature_infos,
-        )
-
-        logging.info("Wrote value annotations to dataset root: %s", dataset.root)
+        # Write columns: sidecar mode or in-place mode
+        if cfg.acp.write_mode == "sidecar":
+            # Derive sidecar subdir from value_field if not explicitly set
+            sidecar_subdir = cfg.acp.sidecar_subdir
+            if sidecar_subdir is None:
+                # Extract tag from value_field: "complementary_info.value_<tag>" -> "<tag>"
+                prefix = "complementary_info.value_"
+                if cfg.acp.value_field.startswith(prefix):
+                    sidecar_subdir = cfg.acp.value_field[len(prefix) :]
+                else:
+                    sidecar_subdir = "default"
+            _write_columns_sidecar(
+                dataset_root=Path(dataset.root),
+                sidecar_subdir=sidecar_subdir,
+                absolute_indices=absolute_indices,
+                columns=columns,
+                feature_infos=feature_infos,
+            )
+        elif cfg.acp.write_mode == "in_place":
+            _write_columns_in_place(
+                dataset_root=Path(dataset.root),
+                absolute_indices=absolute_indices,
+                columns=columns,
+                feature_infos=feature_infos,
+            )
+            logging.info("Wrote value annotations to dataset root (in_place): %s", dataset.root)
+        else:
+            raise ValueError(f"Invalid write_mode '{cfg.acp.write_mode}'")
 
         # Sync computed columns into the in-memory hf_dataset so viz can read them
         for field, values in columns.items():

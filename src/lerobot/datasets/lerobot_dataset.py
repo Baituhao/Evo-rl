@@ -573,6 +573,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
         video_keys_filter: list[str] | None = None,
+        advantage_sidecar: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -692,6 +693,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 during __getitem__. This filters which cameras are loaded from disk, reducing decode time
                 and memory. Useful when the model only uses a subset of available cameras. Defaults to None
                 (decode all video_keys from metadata).
+            advantage_sidecar (bool, optional): Load advantage/value/indicator columns from sidecar
+                parquet files (<root>/advantage/*/frames.parquet) instead of requiring them in the main
+                data parquet. Default True. Set False to load only from main data parquet.
         """
         super().__init__()
         if vcodec not in VALID_VIDEO_CODECS:
@@ -710,6 +714,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes_since_last_encoding = 0
         self.vcodec = vcodec
         self.video_keys_filter = video_keys_filter
+        self.advantage_sidecar = advantage_sidecar
 
         # Unused attributes
         self.image_writer = None
@@ -883,7 +888,79 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
         features = get_hf_features_from_features(self.features)
         hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+
+        # Merge sidecar advantage parquet if enabled
+        if self.advantage_sidecar:
+            hf_dataset = self._merge_advantage_sidecar(hf_dataset)
+
         hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
+    def _merge_advantage_sidecar(self, hf_dataset: datasets.Dataset) -> datasets.Dataset:
+        """Merge advantage/value/indicator columns from sidecar parquet files into hf_dataset.
+
+        Searches for <root>/advantage/*/frames.parquet files, loads each, and joins by index.
+        Missing indices are filled with np.nan (float) or 0 (int).
+        """
+        advantage_dir = self.root / "advantage"
+        if not advantage_dir.exists():
+            return hf_dataset
+
+        sidecar_files = sorted(advantage_dir.glob("*/frames.parquet"))
+        if not sidecar_files:
+            return hf_dataset
+
+        # Get dataset index column
+        dataset_indices = np.asarray(hf_dataset["index"], dtype=np.int64)
+        max_index = int(np.max(dataset_indices))
+
+        for sidecar_path in sidecar_files:
+            try:
+                table = pq.read_table(sidecar_path)
+            except Exception as e:
+                logging.warning("Failed to read sidecar %s: %s", sidecar_path, e)
+                continue
+
+            if "index" not in table.schema.names:
+                logging.warning("Sidecar %s missing 'index' column, skipping", sidecar_path)
+                continue
+
+            sidecar_indices = table["index"].to_numpy().astype(np.int64, copy=False)
+
+            # Build lookup table for each column
+            for col_name in table.schema.names:
+                if col_name == "index":
+                    continue
+
+                col_array = table[col_name].to_numpy()
+                col_dtype = table[col_name].type
+
+                # Determine fill value for missing indices
+                if pa.types.is_floating(col_dtype):
+                    fill_value = np.nan
+                    target_dtype = np.float32
+                elif pa.types.is_integer(col_dtype):
+                    fill_value = 0
+                    target_dtype = np.int64
+                else:
+                    logging.warning("Sidecar column %s has unsupported dtype %s, skipping", col_name, col_dtype)
+                    continue
+
+                # Build lookup: index -> value
+                lookup = np.full(max_index + 1, fill_value, dtype=target_dtype)
+                valid_mask = (sidecar_indices >= 0) & (sidecar_indices <= max_index)
+                lookup[sidecar_indices[valid_mask]] = col_array[valid_mask].astype(target_dtype, copy=False)
+
+                # Extract values aligned with dataset_indices
+                values = lookup[dataset_indices]
+
+                # Add or replace column in hf_dataset
+                if col_name in hf_dataset.column_names:
+                    hf_dataset = hf_dataset.remove_columns([col_name])
+                hf_dataset = hf_dataset.add_column(col_name, values.tolist())
+
+            logging.info("Merged sidecar %s (%d columns)", sidecar_path.name, len(table.schema.names) - 1)
+
         return hf_dataset
 
     def _check_cached_episodes_sufficient(self) -> bool:
