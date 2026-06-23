@@ -14,6 +14,8 @@
 
 ### Environments & Dependencies ###
 .env
+.env.local
+.env.*.local
 .venv
 env/
 venv/
@@ -22,6 +24,25 @@ venv.bak/
 .python-version
 __pypackages__/
 node_modules/
+
+### Credentials & Secrets ###
+# Private keys and certificates
+*.pem
+*.p12
+*.pfx
+*.key
+*.crt
+*.csr
+
+# Credentials files
+*credentials*
+*secrets*
+*secret.*
+*.secret
+config.local.*
+auth.json
+token.json
+.token
 
 # Lock files
 poetry.lock
@@ -153,7 +174,6 @@ dmypy.json
 
 ### HPC & Slurm ###
 nautilus/*.yaml
-*.key
 sbatch*.sh
 
 ### Miscellaneous ###
@@ -187,6 +207,16 @@ datasets_shenjian_oss
 *.xml
 *.part
 AGENTS.md
+
+### Project Specific ###
+# Bash scripts directory
+bash/
+
+# Third-party dependencies
+thirdparty/
+
+# Website assets
+website/
 
 ### AI Tool Configs ###
 .claude/
