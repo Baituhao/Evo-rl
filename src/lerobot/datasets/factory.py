@@ -107,6 +107,7 @@ def resolve_delta_timestamps(
 
     return delta_timestamps
 
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -128,7 +129,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         # Use cfg.value for value training, cfg.policy for policy training
-        model_cfg = getattr(cfg, 'value', None) or cfg.policy
+        model_cfg = getattr(cfg, "value", None) or cfg.policy
         delta_timestamps = resolve_delta_timestamps(model_cfg, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
@@ -169,7 +170,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         )
 
     # Use cfg.value for value training, cfg.policy for policy training
-    model_cfg = getattr(cfg, 'value', None) or cfg.policy
+    model_cfg = getattr(cfg, "value", None) or cfg.policy
     visual_norm_mode = _get_visual_normalization_mode(model_cfg)
     if cfg.dataset.use_imagenet_stats and visual_norm_mode != NormalizationMode.IDENTITY:
         for key in dataset.meta.camera_keys:

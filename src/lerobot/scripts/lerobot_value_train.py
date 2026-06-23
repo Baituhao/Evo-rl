@@ -259,7 +259,7 @@ def value_train(
             batch = value_target_raw_batch_hook(batch, step)
 
         # Preserve TD metadata before preprocessor (which may drop unrecognized fields)
-        td_metadata_keys = ['frame_index', 'episode_length', 'is_failure_data']
+        td_metadata_keys = ["frame_index", "episode_length", "is_failure_data"]
         td_metadata = {k: batch.get(k) for k in td_metadata_keys if k in batch}
 
         if step == 0 and is_main_process:
@@ -271,7 +271,9 @@ def value_train(
         batch.update(td_metadata)
 
         if step == 0 and is_main_process:
-            logging.warning(f"After re-injection: batch has frame_index={('frame_index' in batch)}, episode_length={('episode_length' in batch)}")
+            logging.warning(
+                f"After re-injection: batch has frame_index={('frame_index' in batch)}, episode_length={('episode_length' in batch)}"
+            )
 
         if is_main_process and not logged_first_prompt and cfg.value.task_field in batch:
             task_batch = batch[cfg.value.task_field]

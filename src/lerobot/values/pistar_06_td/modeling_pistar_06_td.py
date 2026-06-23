@@ -25,7 +25,10 @@ from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TO
 from lerobot.utils.import_utils import _transformers_available
 from lerobot.utils.recording_annotations import EPISODE_SUCCESS, resolve_episode_success_label
 from lerobot.values.pistar_06_td.configuration_pistar_06_td import Pistar_06_tdConfig
-from lerobot.values.pistar_06_td.processor_pistar_06_td import PISTAR_06_TD_IMAGE_MASK_KEY, PISTAR_06_TD_IMAGES_KEY
+from lerobot.values.pistar_06_td.processor_pistar_06_td import (
+    PISTAR_06_TD_IMAGE_MASK_KEY,
+    PISTAR_06_TD_IMAGES_KEY,
+)
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoConfig, AutoImageProcessor, AutoModel, AutoModelForCausalLM
@@ -151,6 +154,7 @@ def compute_normalized_value_targets(
 
     return targets
 
+
 def compute_dense_rewards_from_targets(
     targets: np.ndarray,
     episode_indices: np.ndarray,
@@ -171,6 +175,7 @@ def compute_dense_rewards_from_targets(
             rewards[i] = float(targets[i])
 
     return rewards
+
 
 def compute_n_step_advantages(
     rewards: np.ndarray,
@@ -210,6 +215,7 @@ def compute_n_step_advantages(
         advantages[i] = float(discounted_sum + bootstrap - values[i])
 
     return advantages
+
 
 def _resolve_load_dtype(dtype_name: str) -> torch.dtype:
     requested_dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
@@ -497,7 +503,9 @@ class Pistar_06_tdModel(nn.Module):
             # Delta indices case: extract current frame (index 0)
             images = images[:, 0]  # [B, N_cam, C, H, W]
         elif images.ndim != 5:
-            raise ValueError(f"'images' must have shape [B, N, C, H, W] or [B, N_delta, N, C, H, W], got {tuple(images.shape)}.")
+            raise ValueError(
+                f"'images' must have shape [B, N, C, H, W] or [B, N_delta, N, C, H, W], got {tuple(images.shape)}."
+            )
 
         if image_attention_mask.ndim != 2:
             raise ValueError(
@@ -730,7 +738,9 @@ class Pistar_06_tdPolicy(PreTrainedPolicy):
 
         decay = self.config.target_model_ema_decay
         with torch.no_grad():
-            for param, target_param in zip(self.model.parameters(), self.target_model.parameters()):
+            for param, target_param in zip(
+                self.model.parameters(), self.target_model.parameters(), strict=True
+            ):
                 target_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
 
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: ActionSelectKwargs) -> Tensor:
@@ -843,16 +853,16 @@ class Pistar_06_tdPolicy(PreTrainedPolicy):
             batch["episode_length"] = torch.from_numpy(episode_length_lookup[batch_indices_np]).to(
                 dtype=torch.long
             )
-            batch["frame_index"] = torch.from_numpy(frame_index_lookup[batch_indices_np]).to(
-                dtype=torch.long
-            )
+            batch["frame_index"] = torch.from_numpy(frame_index_lookup[batch_indices_np]).to(dtype=torch.long)
             batch["is_failure_data"] = torch.from_numpy(is_failure_lookup[batch_indices_np]).to(
                 dtype=torch.float32
             )
 
             # Debug: log once to confirm hook injection
             if step == 0:
-                logging.warning(f"Hook injected TD metadata: episode_length shape={batch['episode_length'].shape}, frame_index shape={batch['frame_index'].shape}")
+                logging.warning(
+                    f"Hook injected TD metadata: episode_length shape={batch['episode_length'].shape}, frame_index shape={batch['frame_index'].shape}"
+                )
 
             return batch
 
@@ -860,7 +870,7 @@ class Pistar_06_tdPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         # Debug: log batch keys once
-        if not hasattr(self, '_logged_batch_keys'):
+        if not hasattr(self, "_logged_batch_keys"):
             logging.warning(f"Forward batch keys: {list(batch.keys())}")
             self._logged_batch_keys = True
 
@@ -885,13 +895,13 @@ class Pistar_06_tdPolicy(PreTrainedPolicy):
         if is_dual_frame:
             # Split images: current [B, N_cam, C, H, W] and next [B, N_cam, C, H, W]
             images_current = images[:, 0]  # [B, N_cam, C, H, W]
-            images_next = images[:, 1]     # [B, N_cam, C, H, W]
+            images_next = images[:, 1]  # [B, N_cam, C, H, W]
 
             # Split tokens: first B are current-frame prompts, last B are next-frame prompts
             B = images.shape[0]
             if input_ids.shape[0] != 2 * B:
                 raise ValueError(
-                    f"Dual-frame mode: expected input_ids with batch size 2*{B}={2*B}, "
+                    f"Dual-frame mode: expected input_ids with batch size 2*{B}={2 * B}, "
                     f"got {input_ids.shape[0]}. Ensure prompt step produces dual prompts."
                 )
             input_ids_current = input_ids[:B]
@@ -969,16 +979,20 @@ class Pistar_06_tdPolicy(PreTrainedPolicy):
         elif self.target_model is None:
             logging.warning(f"TD loss: target_model is None (td_loss_weight={self.config.td_loss_weight})")
         elif not is_dual_frame:
-            logging.warning(f"TD loss: not dual-frame mode (images.shape={tuple(images.shape if hasattr(images, 'shape') else 'N/A')})")
+            logging.warning(
+                f"TD loss: not dual-frame mode (images.shape={tuple(images.shape if hasattr(images, 'shape') else 'N/A')})"
+            )
 
         if self.config.td_loss_weight > 0 and self.target_model is not None and is_dual_frame:
             # Dual-frame mode: use next-frame observations for V_target(s')
             # Construct sparse terminal rewards (RISE-style)
-            frame_index = batch.get('frame_index')
-            episode_length = batch.get('episode_length')
-            is_failure = batch.get('is_failure_data', torch.zeros(images.shape[0], device=device))
+            frame_index = batch.get("frame_index")
+            episode_length = batch.get("episode_length")
+            is_failure = batch.get("is_failure_data", torch.zeros(images.shape[0], device=device))
 
-            logging.warning(f"TD loss check: frame_index={frame_index is not None}, episode_length={episode_length is not None}, is_failure={is_failure is not None}")
+            logging.warning(
+                f"TD loss check: frame_index={frame_index is not None}, episode_length={episode_length is not None}, is_failure={is_failure is not None}"
+            )
 
             if frame_index is not None and episode_length is not None:
                 if not isinstance(frame_index, Tensor):
@@ -997,8 +1011,10 @@ class Pistar_06_tdPolicy(PreTrainedPolicy):
                 is_terminal = is_terminal.float()
 
                 # Sparse reward: only at terminal frames
-                reward = (is_terminal * is_failure * self.config.td_failure_reward +
-                          is_terminal * (1.0 - is_failure) * self.config.td_success_reward)
+                reward = (
+                    is_terminal * is_failure * self.config.td_failure_reward
+                    + is_terminal * (1.0 - is_failure) * self.config.td_success_reward
+                )
 
                 done = is_terminal
 

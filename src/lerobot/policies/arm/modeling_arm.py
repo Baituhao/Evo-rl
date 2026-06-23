@@ -78,9 +78,7 @@ class ARMEncoder(nn.Module):
 
         self.pos_embedding = nn.Parameter(torch.zeros(1, window_size, d_model))
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, num_heads, 4 * d_model, dropout, batch_first=True
-        )
+        encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, 4 * d_model, dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
         self.ln = nn.LayerNorm(d_model)
@@ -113,9 +111,7 @@ class ARMEncoder(nn.Module):
         x = v + s + g
         x = x + self.pos_embedding[:, :T, :]
 
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-        )
+        causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
         pad_mask = torch.arange(T, device=x.device).expand(B, T) >= lengths.unsqueeze(1)
 
         h = self.transformer(x, mask=causal_mask, src_key_padding_mask=pad_mask, is_causal=True)

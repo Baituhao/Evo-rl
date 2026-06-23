@@ -213,7 +213,7 @@ def _draw_series_legend(
     draw.rounded_rectangle((box_x0, box_y0, box_x1, box_y1), radius=8, fill=(0, 0, 0, 150))
 
     y = box_y0 + padding_y
-    for (label, color, text), row_h in zip(legend_rows, row_heights, strict=True):
+    for (_label, color, text), row_h in zip(legend_rows, row_heights, strict=True):
         cy = y + row_h // 2
         draw.line(
             [(box_x0 + padding_x, cy), (box_x0 + padding_x + line_len, cy)],
@@ -338,7 +338,11 @@ def _draw_overlay(
         for px, py in marker_segments_by_x.items():
             draw.line([(px, py), (px, height - 1)], fill=threshold_marker_color, width=marker_width)
 
-    if draw_indicator_persistent_marker and indicators is not None and len(series_points.get("advantage", [])) >= 1:
+    if (
+        draw_indicator_persistent_marker
+        and indicators is not None
+        and len(series_points.get("advantage", [])) >= 1
+    ):
         marker_segments_by_x: dict[int, int] = {}
         advantage_points = series_points["advantage"]
         last_advantage_idx = min(last, len(indicators) - 1, len(advantage_points) - 1)
@@ -417,7 +421,9 @@ def _draw_overlay(
         indicator_h = indicator_bbox[3] - indicator_bbox[1]
         ix = width - indicator_w - margin_x - 4
         iy = chart_y0 + 6
-        draw.rectangle((ix - 4, iy - 2, ix + indicator_w + 4, iy + indicator_h + 2), fill=(255, 255, 255, 170))
+        draw.rectangle(
+            (ix - 4, iy - 2, ix + indicator_w + 4, iy + indicator_h + 2), fill=(255, 255, 255, 170)
+        )
         draw.text((ix, iy), indicator_text, fill=indicator_fill, font=small_font)
 
     return Image.alpha_composite(rgba, overlay).convert("RGB")
@@ -1002,7 +1008,7 @@ def _export_overlay_videos(
             resolved_preloaded: list[list[Image.Image]] | None = None
             if has_any_preloaded:
                 resolved_preloaded = []
-                for frames, src_path, ts in zip(preloaded_per_cam, src_paths, ts_per_cam):
+                for frames, src_path, ts in zip(preloaded_per_cam, src_paths, ts_per_cam, strict=True):
                     if frames is not None:
                         resolved_preloaded.append(frames)
                     else:
@@ -1090,7 +1096,9 @@ def _export_overlay_videos(
                 continue
 
             if use_image_dtype:
-                preloaded_frames = _load_image_frames_from_parquet(raw_dataset, selected_video_key, ep_positions)
+                preloaded_frames = _load_image_frames_from_parquet(
+                    raw_dataset, selected_video_key, ep_positions
+                )
                 tasks.append(
                     (
                         None,

@@ -88,7 +88,9 @@ class SARMConfig(PreTrainedConfig):
     pretrained_model_path: str | None = None
     device: str | None = None
     image_key: str = OBS_IMAGES + ".top"  # Key for image used from the dataset
-    image_downsample_size: tuple[int, int] | None = None  # Optional (height, width) resize before CLIP encoding
+    image_downsample_size: tuple[int, int] | None = (
+        None  # Optional (height, width) resize before CLIP encoding
+    )
     image_downsample_mode: str = "bilinear"
     image_downsample_antialias: bool = True
     state_key: str = OBS_STATE
@@ -152,7 +154,14 @@ class SARMConfig(PreTrainedConfig):
         # Coerce any plain-dict entries (deserialized from JSON) into PolicyFeature objects
         if self.input_features:
             self.input_features = {
-                k: (PolicyFeature(shape=tuple(v["shape"]), type=FeatureType(v["type"]) if not isinstance(v["type"], FeatureType) else v["type"]) if isinstance(v, dict) else v)
+                k: (
+                    PolicyFeature(
+                        shape=tuple(v["shape"]),
+                        type=FeatureType(v["type"]) if not isinstance(v["type"], FeatureType) else v["type"],
+                    )
+                    if isinstance(v, dict)
+                    else v
+                )
                 for k, v in self.input_features.items()
             }
 
@@ -160,7 +169,9 @@ class SARMConfig(PreTrainedConfig):
         if not self.input_features:
             self.input_features = {}
             if self.image_key:
-                self.input_features[self.image_key] = PolicyFeature(shape=(480, 640, 3), type=FeatureType.VISUAL)
+                self.input_features[self.image_key] = PolicyFeature(
+                    shape=(480, 640, 3), type=FeatureType.VISUAL
+                )
             self.input_features[self.state_key] = PolicyFeature(
                 shape=(self.max_state_dim,),
                 type=FeatureType.STATE,

@@ -31,10 +31,10 @@ from tqdm.auto import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType
 from lerobot.configs.value import ValueInferencePipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import load_info, write_info
-from lerobot.configs.types import FeatureType
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import NormalizerProcessorStep
 from lerobot.scripts.value_infer_viz import (
@@ -52,21 +52,21 @@ from lerobot.utils.utils import init_logging, inside_slurm
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
 from lerobot.values.pistar06.modeling_pistar06 import (
     EpisodeTargetInfo,
-    compute_normalized_value_targets as compute_pistar06_normalized_value_targets,
     compute_dense_rewards_from_targets as compute_pistar06_dense_rewards_from_targets,
     compute_n_step_advantages as compute_pistar06_n_step_advantages,
+    compute_normalized_value_targets as compute_pistar06_normalized_value_targets,
 )
 from lerobot.values.pistar_06_td.configuration_pistar_06_td import Pistar_06_tdConfig
 from lerobot.values.pistar_06_td.modeling_pistar_06_td import (
-    compute_normalized_value_targets as compute_pistar_06_td_normalized_value_targets,
     compute_dense_rewards_from_targets as compute_pistar_06_td_dense_rewards_from_targets,
     compute_n_step_advantages as compute_pistar_06_td_n_step_advantages,
+    compute_normalized_value_targets as compute_pistar_06_td_normalized_value_targets,
 )
 from lerobot.values.value01.configuration_value01 import Value01Config
 from lerobot.values.value01.modeling_value01 import (
-    compute_normalized_value_targets as compute_value01_normalized_value_targets,
     compute_dense_rewards_from_targets as compute_value01_dense_rewards_from_targets,
     compute_n_step_advantages as compute_value01_n_step_advantages,
+    compute_normalized_value_targets as compute_value01_normalized_value_targets,
 )
 
 
@@ -168,7 +168,9 @@ def _load_dataset_distributed(cfg: ValueInferencePipelineConfig, accelerator: Ac
                     )
         except Exception as e:
             if accelerator.is_main_process:
-                logging.warning("Could not load camera_features from checkpoint, will decode all videos: %s", e)
+                logging.warning(
+                    "Could not load camera_features from checkpoint, will decode all videos: %s", e
+                )
 
     dataset_kwargs = {
         "repo_id": cfg.dataset.repo_id,
@@ -242,7 +244,7 @@ def _build_episode_info(
                 raise KeyError(f"Episode {ep_idx} references unknown task index {task_index}.")
         except (ValueError, TypeError):
             if task_name not in dataset.meta.tasks.index:
-                raise KeyError(f"Episode {ep_idx} references unknown task '{task_name}'.")
+                raise KeyError(f"Episode {ep_idx} references unknown task '{task_name}'.") from None
             task_index = int(dataset.meta.tasks.loc[task_name].task_index)
 
         explicit_success = episodes[success_field][i] if has_success else None
@@ -302,6 +304,7 @@ def _compute_value_targets(
         clip_max=value_cfg.bin_max,
     )
 
+
 def _compute_rewards(
     value_cfg: Pistar06Config | Pistar_06_tdConfig | Value01Config,
     targets: np.ndarray,
@@ -323,12 +326,15 @@ def _compute_rewards(
     elif value_type == "pistar_06_td":
         return compute_pistar_06_td_dense_rewards_from_targets(targets, episode_indices, frame_indices)
     elif value_type == "value01":
-        return compute_value01_dense_rewards_from_targets(targets, episode_indices, frame_indices, episode_info)
+        return compute_value01_dense_rewards_from_targets(
+            targets, episode_indices, frame_indices, episode_info
+        )
     else:
         raise ValueError(
             f"Unsupported value type '{value_type}'. "
             "lerobot-value-infer currently supports only 'pistar06', 'pistar_06_td', and 'value01'."
         )
+
 
 def _compute_advantages(
     value_cfg: Pistar06Config | Pistar_06_tdConfig | Value01Config,
@@ -549,18 +555,14 @@ def _truncate_state_stats_to_feature_dim(preprocessor, dataset=None) -> None:
         if keys is not None:
             target_keys = set(keys)
         else:
-            target_keys = {
-                k for k, ft in step.features.items() if ft.type == FeatureType.STATE
-            }
+            target_keys = {k for k, ft in step.features.items() if ft.type == FeatureType.STATE}
         # ACTION stats are applied via a separate path (`_normalize_action`) and
         # are not listed in `normalize_observation_keys`, so include any ACTION
         # feature here too. The checkpoint may bake in higher-dim action stats
         # (e.g. 21-dim) while inference provides only the leading joints (16-dim);
         # the leading dims share identical joint ordering, so slicing keeps
         # normalization consistent with training while matching the tensor shape.
-        target_keys |= {
-            k for k, ft in step.features.items() if ft.type == FeatureType.ACTION
-        }
+        target_keys |= {k for k, ft in step.features.items() if ft.type == FeatureType.ACTION}
         for key in target_keys:
             feature = step.features.get(key)
             if feature is None or not feature.shape:
@@ -726,7 +728,9 @@ def run_value_inference_pipeline(
         interventions = np.zeros(frame_count, dtype=np.float32)
 
     if cfg.acp.expert_episode_field in raw_frames.column_names:
-        expert_episode_labels = np.asarray(raw_frames[cfg.acp.expert_episode_field], dtype=np.float32).reshape(-1)
+        expert_episode_labels = np.asarray(
+            raw_frames[cfg.acp.expert_episode_field], dtype=np.float32
+        ).reshape(-1)
         expert_episode_mask = _compute_episode_positive_mask(
             episode_indices=episode_indices,
             episode_labels=expert_episode_labels,
@@ -880,7 +884,9 @@ def run_value_inference_pipeline(
                 int(np.sum(interventions.astype(np.float32) > 0.5)),
                 cfg.acp.force_expert_episode_positive,
                 cfg.acp.expert_episode_field,
-                int(np.unique(episode_indices[expert_episode_mask]).shape[0]) if bool(np.any(expert_episode_mask)) else 0,
+                int(np.unique(episode_indices[expert_episode_mask]).shape[0])
+                if bool(np.any(expert_episode_mask))
+                else 0,
                 int(np.sum(expert_episode_mask)),
             )
 

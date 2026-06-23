@@ -21,7 +21,6 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-import datasets
 import numpy as np
 import packaging.version
 import pandas as pd
@@ -33,6 +32,7 @@ import torch.utils
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
+import datasets
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.datasets.utils import (

@@ -17,11 +17,11 @@ import logging
 from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
 
-import datasets
 import numpy as np
 import torch
-from datasets import load_dataset
 
+import datasets
+from datasets import load_dataset
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
     Backtrackable,

@@ -30,6 +30,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.arm.configuration_arm import ARMConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -38,7 +39,6 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
-from lerobot.policies.arm.configuration_arm import ARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
@@ -272,17 +272,13 @@ def make_pre_post_processors(
             sarm_override = {"config": policy_cfg}
             if kwargs.get("dataset_meta") is not None:
                 sarm_override["dataset_meta"] = kwargs["dataset_meta"]
-            kwargs["preprocessor_overrides"] = {
-                "SARMEncodingProcessorStep": sarm_override
-            }
+            kwargs["preprocessor_overrides"] = {"SARMEncodingProcessorStep": sarm_override}
 
         elif isinstance(policy_cfg, ARMConfig):
             arm_override = {"config": policy_cfg}
             if kwargs.get("dataset_meta") is not None:
                 arm_override["dataset_meta"] = kwargs["dataset_meta"]
-            kwargs["preprocessor_overrides"] = {
-                "ARMEncodingProcessorStep": arm_override
-            }
+            kwargs["preprocessor_overrides"] = {"ARMEncodingProcessorStep": arm_override}
 
         return (
             PolicyProcessorPipeline.from_pretrained(

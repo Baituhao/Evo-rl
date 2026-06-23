@@ -133,9 +133,7 @@ class ARMConfig(PreTrainedConfig):
         self.output_features["advantage"] = PolicyFeature(
             shape=(self.window_size - 1, self.num_advantage_classes), type=FeatureType.REWARD
         )
-        self.output_features["completion"] = PolicyFeature(
-            shape=(1,), type=FeatureType.REWARD
-        )
+        self.output_features["completion"] = PolicyFeature(shape=(1,), type=FeatureType.REWARD)
 
         # n_obs_steps is an inherited dataclass field; derive it from window_size.
         self.n_obs_steps = self.window_size - 1

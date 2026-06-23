@@ -262,6 +262,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
 "src/lerobot/policies/wall_x/**" = ["N801", "N812", "SIM102", "SIM108", "SIM210", "SIM211", "B006", "B007", "SIM118"] # Supprese these as they are coming from original Qwen2_5_vl code TODO(pepijn): refactor original
+# N801: TD value classes keep the `Pistar_06_td` name to match the registered value type string.
+# N806: tensor-dimension variables (B, T, C, H, W, N_delta, D) follow ML convention, like the sarm/pistar06 modules.
+"src/lerobot/values/pistar_06_td/**" = ["N801", "N806"]
+"src/lerobot/policies/arm/**" = ["N806"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true

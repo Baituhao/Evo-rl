@@ -108,7 +108,7 @@ class Pistar_06_tdPrepareTaskPromptProcessorStep(ProcessorStep):
                     )
 
                 state_current = state[:, 0, :]  # [B, D]
-                state_next = state[:, 1, :]     # [B, D]
+                state_next = state[:, 1, :]  # [B, D]
 
                 # Discretize both frames
                 def discretize(s: Tensor) -> np.ndarray:
@@ -119,12 +119,10 @@ class Pistar_06_tdPrepareTaskPromptProcessorStep(ProcessorStep):
                     return np.digitize(s_np, bins=bins) - 1
 
                 disc_current = discretize(state_current)  # [B, D_padded]
-                disc_next = discretize(state_next)        # [B, D_padded]
+                disc_next = discretize(state_next)  # [B, D_padded]
 
                 if len(tasks) != B:
-                    raise ValueError(
-                        f"Task count ({len(tasks)}) does not match state batch size ({B})."
-                    )
+                    raise ValueError(f"Task count ({len(tasks)}) does not match state batch size ({B}).")
 
                 # Build 2B prompts: [current_0, ..., current_B-1, next_0, ..., next_B-1]
                 prompts_current = []
@@ -280,9 +278,7 @@ class Pistar_06_tdPrepareImagesProcessorStep(ProcessorStep):
                 elif img.ndim == 5:
                     # Already has temporal dimension
                     if img.shape[1] != n_delta:
-                        raise ValueError(
-                            f"Camera '{key}' has N_delta={img.shape[1]}, expected {n_delta}."
-                        )
+                        raise ValueError(f"Camera '{key}' has N_delta={img.shape[1]}, expected {n_delta}.")
                 elif img.ndim == 4 and not has_temporal_dim:
                     # All cameras are single-frame → no unification needed yet
                     pass

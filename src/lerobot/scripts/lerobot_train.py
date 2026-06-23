@@ -380,7 +380,9 @@ def train(
         )
         sampled_num_frames = len(sampler)
         sampled_num_episodes = (
-            len(selected_training_episodes) if selected_training_episodes is not None else dataset.num_episodes
+            len(selected_training_episodes)
+            if selected_training_episodes is not None
+            else dataset.num_episodes
         )
         logging.info(
             (

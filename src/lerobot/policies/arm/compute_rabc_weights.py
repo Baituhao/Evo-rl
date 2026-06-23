@@ -57,7 +57,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -301,9 +301,9 @@ def _render_chart_to_image(
 
     # Only show data up to current_step
     last_step = min(current_step, len(progress_preds) - 1)
-    visible_indices = frame_indices[:last_step + 1]
-    visible_progress = progress_preds[:last_step + 1]
-    visible_stages = stage_preds[:last_step + 1, :]
+    visible_indices = frame_indices[: last_step + 1]
+    visible_progress = progress_preds[: last_step + 1]
+    visible_stages = stage_preds[: last_step + 1, :]
 
     fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
     gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.15)
@@ -805,11 +805,11 @@ def compute_arm_progress(
 
         # Build a DataLoader over the frames to compute for this episode (enables prefetching)
         frame_subset = FrameSubset(dataset, compute_indices, image_key, state_key)
-        loader_kwargs = dict(
-            batch_size=1,
-            shuffle=False,
-            collate_fn=_collate_passthrough,
-        )
+        loader_kwargs = {
+            "batch_size": 1,
+            "shuffle": False,
+            "collate_fn": _collate_passthrough,
+        }
         if num_workers > 0:
             loader_kwargs["num_workers"] = num_workers
             loader_kwargs["prefetch_factor"] = prefetch_size
@@ -1105,7 +1105,9 @@ Examples:
             args.dataset_repo_id, reward_model_path, args.device
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
-        ep_pool = args.episode_indices if args.episode_indices is not None else list(range(dataset.num_episodes))
+        ep_pool = (
+            args.episode_indices if args.episode_indices is not None else list(range(dataset.num_episodes))
+        )
         viz_episodes = ep_pool[: min(args.num_visualizations, len(ep_pool))]
         visualize_arm_predictions(
             dataset=dataset,

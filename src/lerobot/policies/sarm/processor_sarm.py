@@ -51,7 +51,11 @@ from lerobot.processor.converters import (
 )
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.processor.pipeline import PipelineFeatureType
-from lerobot.utils.constants import OBS_STATE, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    OBS_STATE,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 
 class SARMEncodingProcessorStep(ProcessorStep):
@@ -468,10 +472,15 @@ class SARMEncodingProcessorStep(ProcessorStep):
 
         image_tensor = torch.from_numpy(images).float()
         align_corners = False if self.config.image_downsample_mode in {"bilinear", "bicubic"} else None
-        antialias = self.config.image_downsample_antialias if self.config.image_downsample_mode in {
-            "bilinear",
-            "bicubic",
-        } else False
+        antialias = (
+            self.config.image_downsample_antialias
+            if self.config.image_downsample_mode
+            in {
+                "bilinear",
+                "bicubic",
+            }
+            else False
+        )
         resized = F.interpolate(
             image_tensor,
             size=(target_height, target_width),
@@ -571,9 +580,7 @@ def make_sarm_pre_post_processors(
                 norm_map=config.normalization_mapping,
                 stats=dataset_stats,
             ),
-            SARMEncodingProcessorStep(
-                config=config, dataset_meta=dataset_meta, dataset_stats=dataset_stats
-            ),
+            SARMEncodingProcessorStep(config=config, dataset_meta=dataset_meta, dataset_stats=dataset_stats),
             DeviceProcessorStep(device=config.device),
         ],
         name=POLICY_PREPROCESSOR_DEFAULT_NAME,
@@ -648,6 +655,7 @@ def _truncate_stats_to_feature_dim(preprocessor) -> None:
     normalization only applies to the leading dimensions that will actually be used.
     """
     import logging
+
     from lerobot.configs.types import FeatureType
 
     for step in getattr(preprocessor, "steps", []):
@@ -657,7 +665,9 @@ def _truncate_stats_to_feature_dim(preprocessor) -> None:
         for key, feature in step.features.items():
             ftype = _feature_type(feature)
             # ftype may be a FeatureType enum or a string ("STATE") from a serialized config.
-            is_state = ftype == FeatureType.STATE or ftype == "STATE" or getattr(ftype, "value", None) == "STATE"
+            is_state = (
+                ftype == FeatureType.STATE or ftype == "STATE" or getattr(ftype, "value", None) == "STATE"
+            )
             target_dim = _feature_state_dim(feature)
             if not is_state or target_dim is None:
                 continue

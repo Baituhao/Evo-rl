@@ -16,7 +16,6 @@
 
 """ARM utility functions: focal loss, label generation, frame indexing."""
 
-import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 
