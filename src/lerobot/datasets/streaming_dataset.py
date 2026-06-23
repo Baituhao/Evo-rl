@@ -85,6 +85,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         root: str | Path | None = None,
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
+        image_center_crop: tuple[int, int] | None = None,
         delta_timestamps: dict[list[float]] | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
@@ -120,6 +121,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.streaming_from_local = root is not None
 
         self.image_transforms = image_transforms
+        self.image_center_crop = tuple(image_center_crop) if image_center_crop is not None else None
         self.episodes = episodes
         self._episode_index_set = set(episodes) if episodes is not None else None
         self.tolerance_s = tolerance_s
@@ -361,6 +363,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 current_ts, self.delta_indices, episode_boundaries_ts
             )
             video_frames = self._query_videos(query_timestamps, ep_idx)
+
+            if self.image_center_crop is not None:
+                image_keys = [cam for cam in self.meta.camera_keys if cam in video_frames]
+                for cam in image_keys:
+                    video_frames[cam] = self._apply_center_crop(video_frames[cam])
 
             if self.image_transforms is not None:
                 image_keys = [cam for cam in self.meta.camera_keys if cam in video_frames]

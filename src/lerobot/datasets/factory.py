@@ -93,6 +93,15 @@ def resolve_delta_timestamps(
         if key in observation_keys and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
+    # Generic hook: a policy config may declare additional non-standard columns
+    # to window (e.g. ARM's per-frame `tri_state` labels). `extra_delta_timestamps_keys`
+    # maps a dataset column name to a list of integer delta indices.
+    extra_keys = getattr(cfg, "extra_delta_timestamps_keys", None)
+    if extra_keys:
+        for key, indices in extra_keys.items():
+            if key in ds_meta.features and indices is not None:
+                delta_timestamps[key] = [i / ds_meta.fps for i in indices]
+
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
@@ -118,7 +127,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        # Use cfg.value for value training, cfg.policy for policy training
+        model_cfg = getattr(cfg, 'value', None) or cfg.policy
+        delta_timestamps = resolve_delta_timestamps(model_cfg, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -126,6 +137,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
+                image_center_crop=cfg.dataset.image_center_crop,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
@@ -137,6 +149,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
+                image_center_crop=cfg.dataset.image_center_crop,
                 revision=cfg.dataset.revision,
                 max_num_shards=cfg.num_workers,
                 tolerance_s=cfg.tolerance_s,
@@ -155,7 +168,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
-    visual_norm_mode = _get_visual_normalization_mode(cfg.policy)
+    # Use cfg.value for value training, cfg.policy for policy training
+    model_cfg = getattr(cfg, 'value', None) or cfg.policy
+    visual_norm_mode = _get_visual_normalization_mode(model_cfg)
     if cfg.dataset.use_imagenet_stats and visual_norm_mode != NormalizationMode.IDENTITY:
         for key in dataset.meta.camera_keys:
             dataset.meta.stats.setdefault(key, {})

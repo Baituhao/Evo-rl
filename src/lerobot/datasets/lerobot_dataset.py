@@ -563,6 +563,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         root: str | Path | None = None,
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
+        image_center_crop: tuple[int, int] | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
@@ -571,6 +572,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
+        video_keys_filter: list[str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -686,6 +688,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
                 'libsvtav1'. Defaults to 'libsvtav1'. Use 'h264' for faster encoding on systems where AV1
                 encoding is CPU-heavy.
+            video_keys_filter (list[str] | None, optional): If specified, only decode these video keys
+                during __getitem__. This filters which cameras are loaded from disk, reducing decode time
+                and memory. Useful when the model only uses a subset of available cameras. Defaults to None
+                (decode all video_keys from metadata).
         """
         super().__init__()
         if vcodec not in VALID_VIDEO_CODECS:
@@ -693,6 +699,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.repo_id = repo_id
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         self.image_transforms = image_transforms
+        self.image_center_crop = tuple(image_center_crop) if image_center_crop is not None else None
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
         self.tolerance_s = tolerance_s
@@ -702,6 +709,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
         self.vcodec = vcodec
+        self.video_keys_filter = video_keys_filter
 
         # Unused attributes
         self.image_writer = None
@@ -985,7 +993,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
+        # Use filtered video_keys if provided, otherwise use all from metadata
+        video_keys = self.video_keys_filter if self.video_keys_filter is not None else self.meta.video_keys
+        for key in video_keys:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
@@ -1060,6 +1070,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_frames
 
+    def _apply_center_crop(self, frame: torch.Tensor) -> torch.Tensor:
+        """Center-crop a decoded camera frame to ``self.image_center_crop`` (height, width).
+
+        Operates on the last two dims so it supports [C, H, W] and stacked [T, C, H, W] frames.
+        Crop dimensions larger than the frame are clamped to the frame size (no padding).
+        """
+        crop_h, crop_w = self.image_center_crop
+        h, w = frame.shape[-2], frame.shape[-1]
+        crop_h, crop_w = min(crop_h, h), min(crop_w, w)
+        top = (h - crop_h) // 2
+        left = (w - crop_w) // 2
+        return frame[..., top : top + crop_h, left : left + crop_w]
+
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
@@ -1081,6 +1104,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
+
+        if self.image_center_crop is not None:
+            image_keys = [cam for cam in self.meta.camera_keys if cam in item]
+            for cam in image_keys:
+                item[cam] = self._apply_center_crop(item[cam])
 
         if self.image_transforms is not None:
             image_keys = [cam for cam in self.meta.camera_keys if cam in item]
