@@ -19,6 +19,9 @@ class ValueInferenceDatasetConfig:
     episodes: list[int] | None = None
     revision: str | None = None
     download_videos: bool = True
+    # Deterministic center crop applied at dataload time, as (height, width). None disables it.
+    # Set this to the same value used at training time so inference observations match.
+    image_center_crop: tuple[int, int] | None = None
     success_field: str = "episode_success"
     default_success: str = "success"
 
@@ -100,6 +103,10 @@ class ValueInferenceVizConfig:
     vcodec: str = "libsvtav1"
     frame_storage_mode: str = "memory"
     smooth_window: int = 1
+    # Downsample decoded frames so the longest side <= this many pixels before
+    # overlay/encode. Source episodes may be 1080p and several thousand frames;
+    # decoding them whole to float32 can require >80GB and OOM. None disables it.
+    max_frame_size: int | None = 800
 
     def validate(self) -> None:
         if not self.episodes:
@@ -110,6 +117,8 @@ class ValueInferenceVizConfig:
             raise ValueError("'viz.frame_storage_mode' must be one of {'memory', 'disk'}.")
         if self.smooth_window < 1:
             raise ValueError("'viz.smooth_window' must be >= 1. Use 1 to disable smoothing.")
+        if self.max_frame_size is not None and self.max_frame_size < 1:
+            raise ValueError("'viz.max_frame_size' must be >= 1 or null to disable.")
 
 
 @dataclass

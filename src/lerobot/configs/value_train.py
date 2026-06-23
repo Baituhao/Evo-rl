@@ -19,11 +19,12 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.recording_annotations import normalize_episode_success_label
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
+from lerobot.values.pistar_06_td.configuration_pistar_06_td import Pistar_06_tdConfig
 from lerobot.values.value01.configuration_value01 import Value01Config
 
 VALUE_TRAIN_CONFIG_NAME = "value_train_config.json"
 SUPPORTED_VALUE_TYPES = tuple(
-    cfg_cls.get_choice_name(cfg_cls) for cfg_cls in (Pistar06Config, Value01Config)
+    cfg_cls.get_choice_name(cfg_cls) for cfg_cls in (Pistar06Config, Value01Config, Pistar_06_tdConfig)
 )
 
 

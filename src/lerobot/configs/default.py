@@ -32,6 +32,10 @@ class DatasetConfig:
     episodes: list[int] | None = None
     omit_failed: bool = False
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
+    # Deterministic center crop applied at dataload time to every camera frame, as (height, width).
+    # None disables it. Unlike `image_transforms` (train-only augmentation), this is applied whenever
+    # the dataset is loaded, so set the same value at train and inference time to stay consistent.
+    image_center_crop: tuple[int, int] | None = None
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
