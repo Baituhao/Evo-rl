@@ -38,6 +38,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
+from lerobot.policies.arm.configuration_arm import ARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
@@ -119,6 +120,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 
         return SARMRewardModel
+    elif name == "arm":
+        from lerobot.policies.arm.modeling_arm import ARMRewardModel
+
+        return ARMRewardModel
     elif name == "groot":
         from lerobot.policies.groot.modeling_groot import GrootPolicy
 
@@ -263,6 +268,22 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        elif isinstance(policy_cfg, SARMConfig):
+            sarm_override = {"config": policy_cfg}
+            if kwargs.get("dataset_meta") is not None:
+                sarm_override["dataset_meta"] = kwargs["dataset_meta"]
+            kwargs["preprocessor_overrides"] = {
+                "SARMEncodingProcessorStep": sarm_override
+            }
+
+        elif isinstance(policy_cfg, ARMConfig):
+            arm_override = {"config": policy_cfg}
+            if kwargs.get("dataset_meta") is not None:
+                arm_override["dataset_meta"] = kwargs["dataset_meta"]
+            kwargs["preprocessor_overrides"] = {
+                "ARMEncodingProcessorStep": arm_override
+            }
+
         return (
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,
@@ -361,6 +382,14 @@ def make_pre_post_processors(
         from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
 
         processors = make_sarm_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+            dataset_meta=kwargs.get("dataset_meta"),
+        )
+    elif isinstance(policy_cfg, ARMConfig):
+        from lerobot.policies.arm.processor_arm import make_arm_pre_post_processors
+
+        processors = make_arm_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
             dataset_meta=kwargs.get("dataset_meta"),

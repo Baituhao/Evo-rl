@@ -17,6 +17,7 @@
 """SARM Processor for encoding images/text and generating stage+tau targets."""
 
 import random
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -50,7 +51,7 @@ from lerobot.processor.converters import (
 )
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.processor.pipeline import PipelineFeatureType
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import OBS_STATE, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
 class SARMEncodingProcessorStep(ProcessorStep):
@@ -515,6 +516,32 @@ class SARMEncodingProcessorStep(ProcessorStep):
         return features
 
 
+@dataclass
+class TruncateStateProcessorStep(ProcessorStep):
+    """Truncate the state observation to a target dimension before normalization."""
+
+    state_key: str = OBS_STATE
+    target_dim: int = 32
+
+    def get_config(self) -> dict[str, Any]:
+        return {"state_key": self.state_key, "target_dim": self.target_dim}
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
+        if self.state_key in observation:
+            state = torch.as_tensor(observation[self.state_key])
+            if state.shape[-1] > self.target_dim:
+                observation[self.state_key] = state[..., : self.target_dim]
+        transition[TransitionKey.OBSERVATION] = observation
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 def make_sarm_pre_post_processors(
     config: SARMConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -524,27 +551,129 @@ def make_sarm_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """Create pre-processor and post-processor pipelines for SARM."""
-    return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=[
-                AddBatchDimensionProcessorStep(),
-                RenameObservationsProcessorStep(rename_map={}),
-                NormalizerProcessorStep(
-                    features={**config.input_features, **config.output_features},
-                    norm_map=config.normalization_mapping,
-                    stats=dataset_stats,
-                ),
-                SARMEncodingProcessorStep(
-                    config=config, dataset_meta=dataset_meta, dataset_stats=dataset_stats
-                ),
-                DeviceProcessorStep(device=config.device),
-            ],
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-        ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
-            steps=[DeviceProcessorStep(device="cpu")],
-            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
-            to_output=transition_to_policy_action,
-        ),
+    # Determine declared state dim from config (may differ from dataset's actual dim).
+    # The feature may be a PolicyFeature object or a plain dict (when loaded from a
+    # serialized config.json), so read `shape` from either form.
+    state_feature = config.input_features.get(config.state_key)
+    declared_state_dim = _feature_state_dim(state_feature)
+
+    preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+        steps=[
+            AddBatchDimensionProcessorStep(),
+            RenameObservationsProcessorStep(rename_map={}),
+            *(
+                [TruncateStateProcessorStep(state_key=config.state_key, target_dim=declared_state_dim)]
+                if declared_state_dim is not None
+                else []
+            ),
+            NormalizerProcessorStep(
+                features=_coerce_features({**config.input_features, **config.output_features}),
+                norm_map=config.normalization_mapping,
+                stats=dataset_stats,
+            ),
+            SARMEncodingProcessorStep(
+                config=config, dataset_meta=dataset_meta, dataset_stats=dataset_stats
+            ),
+            DeviceProcessorStep(device=config.device),
+        ],
+        name=POLICY_PREPROCESSOR_DEFAULT_NAME,
     )
+
+    # Truncate stats to declared feature dimension
+    _truncate_stats_to_feature_dim(preprocessor)
+
+    postprocessor = PolicyProcessorPipeline[PolicyAction, PolicyAction](
+        steps=[DeviceProcessorStep(device="cpu")],
+        name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+
+    return preprocessor, postprocessor
+
+
+def _as_policy_feature(feature):
+    """Coerce a feature (dict or PolicyFeature) into a PolicyFeature object."""
+    if isinstance(feature, PolicyFeature):
+        return feature
+    if isinstance(feature, dict):
+        ftype = feature["type"]
+        if not isinstance(ftype, FeatureType):
+            ftype = FeatureType(ftype)
+        return PolicyFeature(type=ftype, shape=tuple(feature["shape"]))
+    return feature
+
+
+def _coerce_features(features: dict) -> dict:
+    """Coerce every value in a features dict into a PolicyFeature object.
+
+    Config loaded from a serialized config.json yields plain dicts, while config
+    built in-process yields PolicyFeature objects. Mixing the two breaks
+    NormalizerProcessorStep, which inspects only the first value to decide the form.
+    """
+    return {k: _as_policy_feature(v) for k, v in features.items()}
+
+
+def _feature_shape(feature) -> tuple | list | None:
+    """Read `shape` from a PolicyFeature object or a plain dict (serialized form)."""
+    if feature is None:
+        return None
+    if isinstance(feature, dict):
+        return feature.get("shape")
+    return getattr(feature, "shape", None)
+
+
+def _feature_type(feature):
+    """Read `type` from a PolicyFeature object or a plain dict (serialized form)."""
+    if feature is None:
+        return None
+    if isinstance(feature, dict):
+        return feature.get("type")
+    return getattr(feature, "type", None)
+
+
+def _feature_state_dim(feature) -> int | None:
+    """Last-dim size of a STATE feature, or None if unavailable."""
+    shape = _feature_shape(feature)
+    if not shape:
+        return None
+    return int(shape[-1])
+
+
+def _truncate_stats_to_feature_dim(preprocessor) -> None:
+    """Truncate normalizer stats to match declared feature dimensions.
+
+    When config declares a lower dimension than dataset stats (e.g., config specifies
+    16-dim state but dataset has 21-dim), truncate stats to the declared dimension so
+    normalization only applies to the leading dimensions that will actually be used.
+    """
+    import logging
+    from lerobot.configs.types import FeatureType
+
+    for step in getattr(preprocessor, "steps", []):
+        if not isinstance(step, NormalizerProcessorStep):
+            continue
+
+        for key, feature in step.features.items():
+            ftype = _feature_type(feature)
+            # ftype may be a FeatureType enum or a string ("STATE") from a serialized config.
+            is_state = ftype == FeatureType.STATE or ftype == "STATE" or getattr(ftype, "value", None) == "STATE"
+            target_dim = _feature_state_dim(feature)
+            if not is_state or target_dim is None:
+                continue
+
+            # Truncate _tensor_stats
+            if step._tensor_stats and key in step._tensor_stats:
+                for stat_name, tensor in list(step._tensor_stats[key].items()):
+                    if tensor.ndim >= 1 and tensor.shape[-1] > target_dim:
+                        step._tensor_stats[key][stat_name] = tensor[..., :target_dim].contiguous()
+
+            # Truncate raw stats
+            if step.stats and key in step.stats:
+                for stat_name, value in list(step.stats[key].items()):
+                    arr = np.asarray(value)
+                    if arr.ndim >= 1 and arr.shape[-1] > target_dim:
+                        step.stats[key][stat_name] = arr[..., :target_dim]
+                        logging.info(
+                            f"Truncated SARM normalizer stat '{key}.{stat_name}' from dim {arr.shape[-1]} to {target_dim}"
+                        )

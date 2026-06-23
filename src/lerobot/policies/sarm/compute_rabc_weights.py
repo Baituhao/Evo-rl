@@ -57,6 +57,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -154,6 +155,7 @@ def load_sarm_resources(
     dataset_repo_id: str,
     reward_model_path: str,
     device: str = "cuda",
+    image_center_crop: tuple[int, int] | None = None,
 ) -> tuple[LeRobotDataset, SARMRewardModel, any]:
     """
     Load SARM model, dataset, and preprocessor.
@@ -179,7 +181,7 @@ def load_sarm_resources(
         image_key: [idx / fps for idx in delta_indices],
         state_key: [idx / fps for idx in delta_indices],
     }
-    dataset = LeRobotDataset(**ds_kwargs, delta_timestamps=delta_timestamps)
+    dataset = LeRobotDataset(**ds_kwargs, delta_timestamps=delta_timestamps, image_center_crop=image_center_crop)
     logging.info(f"Dataset: {dataset.num_episodes} episodes, {dataset.num_frames} frames")
 
     preprocess, _ = make_sarm_pre_post_processors(
@@ -283,6 +285,146 @@ def visualize_episode(
     print(f"Saved: {output_path}")
 
 
+def _render_chart_to_image(
+    progress_preds: np.ndarray,
+    stage_preds: np.ndarray,
+    stage_labels: list[str],
+    current_step: int,
+    width: int,
+    height: int,
+) -> Image.Image:
+    """Render progress + stage probability chart using matplotlib (same style as PNG visualization)."""
+    num_stages = stage_preds.shape[1]
+    colors = plt.cm.tab10(np.linspace(0, 1, num_stages))
+    frame_indices = np.arange(len(progress_preds))
+
+    # Only show data up to current_step
+    last_step = min(current_step, len(progress_preds) - 1)
+    visible_indices = frame_indices[:last_step + 1]
+    visible_progress = progress_preds[:last_step + 1]
+    visible_stages = stage_preds[:last_step + 1, :]
+
+    fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
+    gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.15)
+    ax_progress = fig.add_subplot(gs[0])
+    ax_stages = fig.add_subplot(gs[1])
+
+    # Progress plot
+    ax_progress.plot(visible_indices, visible_progress, linewidth=2, color="#2E86AB")
+    ax_progress.fill_between(visible_indices, 0, visible_progress, alpha=0.3, color="#2E86AB")
+    ax_progress.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5)
+    ax_progress.set_ylabel("Progress", fontsize=9)
+    ax_progress.set_ylim(-0.05, 1.1)
+    ax_progress.grid(True, alpha=0.3)
+    ax_progress.set_xlim(0, len(progress_preds) - 1)
+    ax_progress.tick_params(labelsize=8)
+
+    # Stage predictions
+    ax_stages.stackplot(
+        visible_indices,
+        *[visible_stages[:, i] for i in range(num_stages)],
+        colors=colors,
+        alpha=0.8,
+        labels=stage_labels,
+    )
+    ax_stages.set_xlabel("Frame", fontsize=9)
+    ax_stages.set_ylabel("Stage Probability", fontsize=9)
+    ax_stages.set_ylim(0, 1)
+    ax_stages.legend(loc="upper left", ncol=min(num_stages, 5), fontsize=7)
+    ax_stages.grid(True, alpha=0.3)
+    ax_stages.set_xlim(0, len(progress_preds) - 1)
+    ax_stages.tick_params(labelsize=8)
+
+    # Convert to PIL Image
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    plt.close(fig)
+
+    return Image.fromarray(buf, mode="RGBA").convert("RGB")
+
+
+def render_episode_video(
+    dataset: "LeRobotDataset",
+    episode_idx: int,
+    image_key: str,
+    progress_preds: np.ndarray,
+    stage_preds: np.ndarray,
+    stage_labels: list[str],
+    scheme: str,
+    output_path: "Path",
+    fps: int = 30,
+):
+    """Render video with frame on top and dynamic chart below (PNG visualization style)."""
+    try:
+        import av
+    except ImportError:
+        logging.warning("PyAV not installed, skipping video rendering. Install with: pip install av")
+        return
+
+    ep = dataset.meta.episodes[episode_idx]
+    ep_start = ep["dataset_from_index"]
+    ep_end = ep["dataset_to_index"]
+    num_frames = ep_end - ep_start
+
+    # Load all frames
+    frames: list[Image.Image] = []
+    for i in range(num_frames):
+        frame_idx = ep_start + i
+        sample = dataset[frame_idx]
+        img = to_numpy_image(sample[image_key])
+        frames.append(Image.fromarray(img))
+
+    if len(frames) == 0:
+        logging.warning(f"No frames to render for episode {episode_idx}")
+        return
+
+    # Determine layout: frame on top, chart below
+    frame_width = frames[0].width
+    frame_height = frames[0].height
+    chart_height = max(300, frame_height // 2)  # Chart takes ~1/3 of total height
+    total_height = frame_height + chart_height
+
+    # Compose frames with dynamic charts
+    composed_frames: list[Image.Image] = []
+    for i in tqdm(range(num_frames), desc=f"Rendering video ep{episode_idx}", leave=False):
+        # Render chart for current step
+        chart_img = _render_chart_to_image(
+            progress_preds=progress_preds,
+            stage_preds=stage_preds,
+            stage_labels=stage_labels,
+            current_step=i,
+            width=frame_width,
+            height=chart_height,
+        )
+
+        # Combine frame + chart vertically
+        combined = Image.new("RGB", (frame_width, total_height))
+        combined.paste(frames[i], (0, 0))
+        combined.paste(chart_img, (0, frame_height))
+        composed_frames.append(combined)
+
+    # Encode to video
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    vcodec = "libx264"
+    video_options = {"g": "2", "crf": "23"}
+    pix_fmt = "yuv420p"
+
+    with av.open(str(output_path), "w") as output:
+        out_stream = output.add_stream(vcodec, fps, options=video_options)
+        out_stream.pix_fmt = pix_fmt
+        out_stream.width = composed_frames[0].width
+        out_stream.height = composed_frames[0].height
+        for pil_img in composed_frames:
+            av_frame = av.VideoFrame.from_image(pil_img.convert("RGB"))
+            for packet in out_stream.encode(av_frame):
+                output.mux(packet)
+        for packet in out_stream.encode():
+            output.mux(packet)
+
+    print(f"Saved video: {output_path}")
+
+
 def visualize_sarm_predictions(
     dataset: LeRobotDataset,
     reward_model: SARMRewardModel,
@@ -292,6 +434,9 @@ def visualize_sarm_predictions(
     output_dir: Path,
     num_display_frames: int = 5,
     stride: int = 1,
+    render_video: bool = False,
+    video_fps: int = 30,
+    task_name: str | None = None,
 ):
     """
     Visualize SARM predictions for multiple episodes.
@@ -308,6 +453,8 @@ def visualize_sarm_predictions(
         output_dir: Directory to save visualizations
         num_display_frames: Number of frames to display in thumbnail strip (default: 5)
         stride: Compute predictions every N frames, interpolate the rest (default: 1)
+        render_video: Also render per-frame overlay mp4 video (default: False)
+        video_fps: Frame rate of rendered video (default: 15)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -338,7 +485,7 @@ def visualize_sarm_predictions(
         ep = dataset.meta.episodes[episode_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
-        task = dataset[ep_start].get("task", "perform the task")
+        task = task_name if task_name is not None else dataset[ep_start].get("task", "perform the task")
         num_frames = ep_end - ep_start
 
         # Select frames for display thumbnails (evenly sampled from begin to end)
@@ -495,6 +642,20 @@ def visualize_sarm_predictions(
                 gt_stages=sd["viz_gt_stages"] if not np.all(np.isnan(sd["viz_gt_stages"])) else None,
             )
 
+            if render_video:
+                video_path = output_dir / f"sarm_prediction_ep{episode_idx}_{scheme}.mp4"
+                render_episode_video(
+                    dataset=dataset,
+                    episode_idx=episode_idx,
+                    image_key=image_key,
+                    progress_preds=sd["viz_progress"],
+                    stage_preds=sd["viz_stages"],
+                    stage_labels=stage_labels,
+                    scheme=scheme,
+                    output_path=video_path,
+                    fps=video_fps,
+                )
+
         # Clear memory between episodes
         torch.cuda.empty_cache()
 
@@ -559,6 +720,9 @@ def compute_sarm_progress(
     episode_indices: list[int] | None = None,
     num_workers: int = 0,
     prefetch_size: int = 2,
+    render_video: bool = False,
+    task_name: str | None = None,
+    image_center_crop: tuple[int, int] | None = None,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -575,8 +739,9 @@ def compute_sarm_progress(
         episode_indices: List of episode indices to process. If None, processes all episodes.
         num_workers: Number of DataLoader worker processes (default: 0 = single process, recommended for video datasets)
         prefetch_size: Number of batches to prefetch (default: 2, works in both single/multi-process modes)
+        task_name: Override the task description string for all episodes. If None, uses the task from dataset metadata.
     """
-    dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device)
+    dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device, image_center_crop=image_center_crop)
 
     # Set preprocessor to eval mode to disable augmentations
     if hasattr(preprocess, "eval"):
@@ -631,7 +796,7 @@ def compute_sarm_progress(
         ep_end = ep["dataset_to_index"]
 
         # Get task description
-        task = dataset[ep_start].get("task", "perform the task")
+        task = task_name if task_name is not None else dataset[ep_start].get("task", "perform the task")
 
         # Generate frames to compute (with stride applied)
         all_ep_indices = generate_all_frame_indices(ep_start, ep_end, frame_gap)
@@ -826,6 +991,8 @@ def compute_sarm_progress(
             head_mode=head_mode,
             output_dir=Path(output_dir),
             stride=stride,
+            render_video=render_video,
+            task_name=task_name,
         )
 
     return output_path
@@ -900,10 +1067,16 @@ Examples:
         help="Output directory for visualizations (default: ./sarm_viz)",
     )
     parser.add_argument(
+        "--render-video",
+        action="store_true",
+        default=False,
+        help="Enable mp4 video rendering alongside PNG visualizations",
+    )
+    parser.add_argument(
         "--push-to-hub",
         action="store_true",
         help="Upload progress file to the dataset repo on HuggingFace Hub",
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--stride",
@@ -930,6 +1103,19 @@ Examples:
         default=2,
         help="Number of batches to prefetch (default: 2, works in both single/multi-process modes)",
     )
+    parser.add_argument(
+        "--task-name",
+        type=str,
+        default=None,
+        help="Override task description for all episodes (useful when dataset task field is 'default' or empty)",
+    )
+    parser.add_argument(
+        "--image-center-crop",
+        type=lambda s: tuple(int(x) for x in s.strip("[]").split(",")),
+        default=None,
+        metavar="H,W",
+        help="Center-crop every camera frame to (H, W) at dataload time, e.g. 800,800",
+    )
 
     args = parser.parse_args()
 
@@ -953,7 +1139,7 @@ Examples:
     # Handle visualize-only mode
     if args.visualize_only:
         dataset, reward_model, preprocess = load_sarm_resources(
-            args.dataset_repo_id, reward_model_path, args.device
+            args.dataset_repo_id, reward_model_path, args.device, image_center_crop=args.image_center_crop
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
         ep_pool = args.episode_indices if args.episode_indices is not None else list(range(dataset.num_episodes))
@@ -966,6 +1152,8 @@ Examples:
             head_mode=args.head_mode,
             output_dir=Path(args.output_dir),
             stride=args.stride,
+            render_video=args.render_video,
+            task_name=args.task_name,
         )
         print(f"\nVisualizations saved to: {Path(args.output_dir).absolute()}")
         return
@@ -983,6 +1171,9 @@ Examples:
         episode_indices=args.episode_indices,
         num_workers=args.num_workers,
         prefetch_size=args.prefetch_size,
+        render_video=args.render_video,
+        task_name=args.task_name,
+        image_center_crop=args.image_center_crop,
     )
 
     print(f"\nSARM progress values saved to: {output_path}")
