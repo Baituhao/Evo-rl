@@ -67,7 +67,15 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
+    # Update target model for RISE-style online TD bootstrap
+    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update_target_model"):
+        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update_target_model()
+
     train_metrics.loss = loss.item()
+    if "loss_ce" in output_dict:
+        train_metrics.loss_ce = output_dict["loss_ce"]
+    if "loss_td" in output_dict:
+        train_metrics.loss_td = output_dict["loss_td"]
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -219,6 +227,8 @@ def value_train(
 
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
+        "loss_ce": AverageMeter("ce", ":.3f"),
+        "loss_td": AverageMeter("td", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
@@ -247,7 +257,21 @@ def value_train(
         batch = next(dl_iter)
         if value_target_raw_batch_hook is not None:
             batch = value_target_raw_batch_hook(batch, step)
+
+        # Preserve TD metadata before preprocessor (which may drop unrecognized fields)
+        td_metadata_keys = ['frame_index', 'episode_length', 'is_failure_data']
+        td_metadata = {k: batch.get(k) for k in td_metadata_keys if k in batch}
+
+        if step == 0 and is_main_process:
+            logging.warning(f"Before preprocessor: td_metadata keys = {list(td_metadata.keys())}")
+
         batch = preprocessor(batch)
+
+        # Re-inject TD metadata after preprocessing
+        batch.update(td_metadata)
+
+        if step == 0 and is_main_process:
+            logging.warning(f"After re-injection: batch has frame_index={('frame_index' in batch)}, episode_length={('episode_length' in batch)}")
 
         if is_main_process and not logged_first_prompt and cfg.value.task_field in batch:
             task_batch = batch[cfg.value.task_field]

@@ -34,7 +34,9 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.value import ValueInferencePipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import load_info, write_info
+from lerobot.configs.types import FeatureType
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.processor import NormalizerProcessorStep
 from lerobot.scripts.value_infer_viz import (
     _export_overlay_videos,
 )
@@ -53,6 +55,12 @@ from lerobot.values.pistar06.modeling_pistar06 import (
     compute_normalized_value_targets as compute_pistar06_normalized_value_targets,
     compute_dense_rewards_from_targets as compute_pistar06_dense_rewards_from_targets,
     compute_n_step_advantages as compute_pistar06_n_step_advantages,
+)
+from lerobot.values.pistar_06_td.configuration_pistar_06_td import Pistar_06_tdConfig
+from lerobot.values.pistar_06_td.modeling_pistar_06_td import (
+    compute_normalized_value_targets as compute_pistar_06_td_normalized_value_targets,
+    compute_dense_rewards_from_targets as compute_pistar_06_td_dense_rewards_from_targets,
+    compute_n_step_advantages as compute_pistar_06_td_n_step_advantages,
 )
 from lerobot.values.value01.configuration_value01 import Value01Config
 from lerobot.values.value01.modeling_value01 import (
@@ -140,12 +148,36 @@ def _resolve_pretrained_model_dir(checkpoint_path: str, checkpoint_ref: str) -> 
 
 
 def _load_dataset_distributed(cfg: ValueInferencePipelineConfig, accelerator: Accelerator) -> LeRobotDataset:
+    # Load camera_features from checkpoint to filter video decoding
+    video_keys_filter = None
+    if cfg.inference.checkpoint_path:
+        try:
+            pretrained_dir = _resolve_pretrained_model_dir(
+                checkpoint_path=cfg.inference.checkpoint_path,
+                checkpoint_ref=cfg.inference.checkpoint_ref,
+            )
+            checkpoint_config = PreTrainedConfig.from_pretrained(pretrained_dir)
+            camera_features = getattr(checkpoint_config, "camera_features", None)
+            if camera_features and len(camera_features) > 0:
+                video_keys_filter = camera_features
+                if accelerator.is_main_process:
+                    logging.info(
+                        "Filtering video decode to %d cameras from checkpoint config: %s",
+                        len(video_keys_filter),
+                        video_keys_filter,
+                    )
+        except Exception as e:
+            if accelerator.is_main_process:
+                logging.warning("Could not load camera_features from checkpoint, will decode all videos: %s", e)
+
     dataset_kwargs = {
         "repo_id": cfg.dataset.repo_id,
         "root": cfg.dataset.root,
         "episodes": cfg.dataset.episodes,
         "revision": cfg.dataset.revision,
         "download_videos": cfg.dataset.download_videos,
+        "image_center_crop": cfg.dataset.image_center_crop,
+        "video_keys_filter": video_keys_filter,
     }
 
     if accelerator.is_main_process:
@@ -232,7 +264,7 @@ def _build_episode_info(
 
 
 def _compute_value_targets(
-    value_cfg: Pistar06Config | Value01Config,
+    value_cfg: Pistar06Config | Pistar_06_tdConfig | Value01Config,
     episode_indices: np.ndarray,
     frame_indices: np.ndarray,
     episode_info: dict[int, EpisodeTargetInfo],
@@ -243,17 +275,21 @@ def _compute_value_targets(
     if value_type is None:
         if isinstance(value_cfg, Pistar06Config):
             value_type = "pistar06"
+        elif isinstance(value_cfg, Pistar_06_tdConfig):
+            value_type = "pistar_06_td"
         elif isinstance(value_cfg, Value01Config):
             value_type = "value01"
 
     if value_type == "pistar06":
         compute_targets_fn = compute_pistar06_normalized_value_targets
+    elif value_type == "pistar_06_td":
+        compute_targets_fn = compute_pistar_06_td_normalized_value_targets
     elif value_type == "value01":
         compute_targets_fn = compute_value01_normalized_value_targets
     else:
         raise ValueError(
             f"Unsupported value type '{value_type}'. "
-            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
+            "lerobot-value-infer currently supports only 'pistar06', 'pistar_06_td', and 'value01'."
         )
 
     return compute_targets_fn(
@@ -267,7 +303,7 @@ def _compute_value_targets(
     )
 
 def _compute_rewards(
-    value_cfg: Pistar06Config | Value01Config,
+    value_cfg: Pistar06Config | Pistar_06_tdConfig | Value01Config,
     targets: np.ndarray,
     episode_indices: np.ndarray,
     frame_indices: np.ndarray,
@@ -277,21 +313,25 @@ def _compute_rewards(
     if value_type is None:
         if isinstance(value_cfg, Pistar06Config):
             value_type = "pistar06"
+        elif isinstance(value_cfg, Pistar_06_tdConfig):
+            value_type = "pistar_06_td"
         elif isinstance(value_cfg, Value01Config):
             value_type = "value01"
 
     if value_type == "pistar06":
         return compute_pistar06_dense_rewards_from_targets(targets, episode_indices, frame_indices)
+    elif value_type == "pistar_06_td":
+        return compute_pistar_06_td_dense_rewards_from_targets(targets, episode_indices, frame_indices)
     elif value_type == "value01":
         return compute_value01_dense_rewards_from_targets(targets, episode_indices, frame_indices, episode_info)
     else:
         raise ValueError(
             f"Unsupported value type '{value_type}'. "
-            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
+            "lerobot-value-infer currently supports only 'pistar06', 'pistar_06_td', and 'value01'."
         )
 
 def _compute_advantages(
-    value_cfg: Pistar06Config | Value01Config,
+    value_cfg: Pistar06Config | Pistar_06_tdConfig | Value01Config,
     rewards: np.ndarray,
     values: np.ndarray,
     episode_indices: np.ndarray,
@@ -303,11 +343,15 @@ def _compute_advantages(
     if value_type is None:
         if isinstance(value_cfg, Pistar06Config):
             value_type = "pistar06"
+        elif isinstance(value_cfg, Pistar_06_tdConfig):
+            value_type = "pistar_06_td"
         elif isinstance(value_cfg, Value01Config):
             value_type = "value01"
 
     if value_type == "pistar06":
         return compute_pistar06_n_step_advantages(rewards, values, episode_indices, frame_indices, n_step)
+    elif value_type == "pistar_06_td":
+        return compute_pistar_06_td_n_step_advantages(rewards, values, episode_indices, frame_indices, n_step)
     elif value_type == "value01":
         return compute_value01_n_step_advantages(
             rewards,
@@ -320,7 +364,7 @@ def _compute_advantages(
     else:
         raise ValueError(
             f"Unsupported value type '{value_type}'. "
-            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
+            "lerobot-value-infer currently supports only 'pistar06', 'pistar_06_td', and 'value01'."
         )
 
 
@@ -470,6 +514,83 @@ def _write_columns_in_place(
     _update_feature_metadata(dataset_root=dataset_root, feature_infos=feature_infos)
 
 
+def _truncate_state_stats_to_feature_dim(preprocessor, dataset=None) -> None:
+    """Truncate normalizer state stats to the feature's declared dim.
+
+    The checkpoint may bake in normalization stats computed on a higher-dim
+    training dataset (e.g. 21-dim state with extra waist/head joints), while the
+    inference dataset only provides the leading joints (e.g. 16-dim). Because the
+    leading dims share identical joint ordering, we slice the stored training
+    stats down to the declared feature dim so normalization stays consistent with
+    training while matching the incoming tensor shape.
+
+    Both `_tensor_stats` (used during transform) and `stats` (the source `to()`
+    rebuilds from) are sliced, so device/dtype moves cannot restore the old dim.
+
+    The truncation target is the inference dataset's real feature dim when
+    available (via `dataset.meta`). The checkpoint config may declare a larger
+    dim than the data actually provides (e.g. action declared 21-dim while the
+    inference dataset stores 16-dim), so relying on the declared feature shape
+    alone would miss those cases.
+    """
+    dataset_dims: dict[str, int] = {}
+    meta = getattr(dataset, "meta", None)
+    feats = getattr(meta, "features", None)
+    if feats:
+        for key, ft in feats.items():
+            shape = ft.get("shape") if isinstance(ft, dict) else None
+            if shape:
+                dataset_dims[key] = int(shape[-1])
+
+    for step in getattr(preprocessor, "steps", []):
+        if not isinstance(step, NormalizerProcessorStep):
+            continue
+        keys = step.normalize_observation_keys
+        if keys is not None:
+            target_keys = set(keys)
+        else:
+            target_keys = {
+                k for k, ft in step.features.items() if ft.type == FeatureType.STATE
+            }
+        # ACTION stats are applied via a separate path (`_normalize_action`) and
+        # are not listed in `normalize_observation_keys`, so include any ACTION
+        # feature here too. The checkpoint may bake in higher-dim action stats
+        # (e.g. 21-dim) while inference provides only the leading joints (16-dim);
+        # the leading dims share identical joint ordering, so slicing keeps
+        # normalization consistent with training while matching the tensor shape.
+        target_keys |= {
+            k for k, ft in step.features.items() if ft.type == FeatureType.ACTION
+        }
+        for key in target_keys:
+            feature = step.features.get(key)
+            if feature is None or not feature.shape:
+                continue
+            # Prefer the inference dataset's real dim; fall back to the declared
+            # feature shape. The checkpoint may declare a larger dim than the
+            # data provides (e.g. action 21-dim declared vs 16-dim in data).
+            target_dim = dataset_dims.get(key, int(feature.shape[-1]))
+
+            tensor_stats = step._tensor_stats.get(key)
+            if tensor_stats:
+                for stat_name, tensor in list(tensor_stats.items()):
+                    if tensor.ndim >= 1 and tensor.shape[-1] > target_dim:
+                        tensor_stats[stat_name] = tensor[..., :target_dim].contiguous()
+
+            raw_stats = (step.stats or {}).get(key)
+            if raw_stats:
+                for stat_name, value in list(raw_stats.items()):
+                    arr = np.asarray(value)
+                    if arr.ndim >= 1 and arr.shape[-1] > target_dim:
+                        raw_stats[stat_name] = arr[..., :target_dim]
+                        logging.info(
+                            "Truncated normalizer stat '%s.%s' from dim %d to %d.",
+                            key,
+                            stat_name,
+                            arr.shape[-1],
+                            target_dim,
+                        )
+
+
 def _load_value_policy_and_processors(
     cfg: ValueInferencePipelineConfig,
     dataset: LeRobotDataset,
@@ -477,10 +598,10 @@ def _load_value_policy_and_processors(
     device: torch.device,
 ):
     value_cfg = PreTrainedConfig.from_pretrained(pretrained_dir)
-    if not isinstance(value_cfg, (Pistar06Config, Value01Config)):
+    if not isinstance(value_cfg, (Pistar06Config, Pistar_06_tdConfig, Value01Config)):
         raise ValueError(
             f"Unsupported value config type '{type(value_cfg)}'. "
-            "lerobot-value-infer currently supports only 'pistar06' and 'value01'."
+            "lerobot-value-infer currently supports only 'pistar06', 'pistar_06_td', and 'value01'."
         )
 
     value_cfg.pretrained_path = pretrained_dir
@@ -497,6 +618,7 @@ def _load_value_policy_and_processors(
         pretrained_path=pretrained_dir,
         preprocessor_overrides={"device_processor": {"device": device.type}},
     )
+    _truncate_state_stats_to_feature_dim(preprocessor, dataset)
     return value_policy, value_cfg, preprocessor
 
 
@@ -519,6 +641,7 @@ def _export_visualization_outputs(
         vcodec=cfg.viz.vcodec,
         frame_storage_mode=cfg.viz.frame_storage_mode,
         smooth_window=cfg.viz.smooth_window,
+        max_frame_size=cfg.viz.max_frame_size,
     )
     logging.info("Exported %d overlay videos to %s", len(written_videos), viz_output_dir)
     return [str(path) for path in written_videos]

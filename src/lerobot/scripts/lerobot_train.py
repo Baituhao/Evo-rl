@@ -305,13 +305,14 @@ def train(
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
+        if cfg.policy.type != "sarm":
+            postprocessor_kwargs["postprocessor_overrides"] = {
+                "unnormalizer_processor": {
+                    "stats": dataset.meta.stats,
+                    "features": policy.config.output_features,
+                    "norm_map": policy.config.normalization_mapping,
+                },
+            }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,

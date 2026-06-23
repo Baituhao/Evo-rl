@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image, ImageDraw, ImageFont
 from scipy.signal import savgol_filter
 from tqdm.auto import tqdm
@@ -439,20 +440,31 @@ def _build_output_video_path_multiview(
     return output_dir / f"{repo_tag}_episode_{episode_index:04d}_{keys_tag}_multiview.mp4"
 
 
-def _decode_frames_at_timestamps(
-    video_file: Path,
-    timestamps_s: np.ndarray,
-    tolerance_s: float,
-    backend: str | None,
+# Decode at most this many frames per call to ``decode_video_frames``. A full
+# 1080p episode can be several thousand frames; decoding them all at once
+# produces a single float32 tensor of 1920*1080*3*4 bytes/frame (~24MB/frame,
+# i.e. >100GB for a 4k-frame episode) before any downsample can run, which OOMs.
+# Decoding in bounded chunks caps peak RAM to roughly chunk_size full frames.
+_DECODE_CHUNK_FRAMES = 256
+
+
+def _frames_tensor_to_pil(
+    frames: "torch.Tensor",
+    max_frame_size: int | None,
 ) -> list[Image.Image]:
-    if timestamps_s.size == 0:
-        return []
-    frames = decode_video_frames(
-        video_path=video_file,
-        timestamps=timestamps_s.tolist(),
-        tolerance_s=tolerance_s,
-        backend=backend,
-    )
+    # Downsample while still a tensor, before the .numpy() copy and the float
+    # *255 conversion below. Source frames may be 1080p; shrinking here caps
+    # every downstream copy.
+    if max_frame_size is not None and frames.ndim == 4:
+        h, w = int(frames.shape[-2]), int(frames.shape[-1])
+        longest = max(h, w)
+        if longest > max_frame_size:
+            scale = max_frame_size / longest
+            new_h = max(1, int(round(h * scale)))
+            new_w = max(1, int(round(w * scale)))
+            frames = torch.nn.functional.interpolate(
+                frames, size=(new_h, new_w), mode="bilinear", align_corners=False
+            )
     np_frames = frames.detach().cpu().numpy()
     if np_frames.ndim != 4:
         raise ValueError(f"Unexpected decoded frame tensor shape: {np_frames.shape}")
@@ -469,6 +481,34 @@ def _decode_frames_at_timestamps(
             np_frames = np.clip(np_frames, 0, 255)
         np_frames = np_frames.astype(np.uint8)
     return [Image.fromarray(np_frames[i]) for i in range(np_frames.shape[0])]
+
+
+def _decode_frames_at_timestamps(
+    video_file: Path,
+    timestamps_s: np.ndarray,
+    tolerance_s: float,
+    backend: str | None,
+    max_frame_size: int | None = None,
+) -> list[Image.Image]:
+    if timestamps_s.size == 0:
+        return []
+    # Decode in bounded chunks so peak memory stays proportional to the chunk
+    # size, not the whole episode. Each chunk is downsampled and converted to
+    # uint8 PIL images before the next chunk is decoded, so the large float32
+    # tensor is released between chunks.
+    ts_list = timestamps_s.tolist()
+    pil_frames: list[Image.Image] = []
+    for start in range(0, len(ts_list), _DECODE_CHUNK_FRAMES):
+        chunk = ts_list[start : start + _DECODE_CHUNK_FRAMES]
+        frames = decode_video_frames(
+            video_path=video_file,
+            timestamps=chunk,
+            tolerance_s=tolerance_s,
+            backend=backend,
+        )
+        pil_frames.extend(_frames_tensor_to_pil(frames, max_frame_size))
+        del frames
+    return pil_frames
 
 
 def _is_image_dtype(dataset: LeRobotDataset, cam_key: str) -> bool:
@@ -617,6 +657,7 @@ def _export_single_episode(
     advantage_threshold: float | None = None,
     draw_indicator_persistent_marker: bool = False,
     draw_indicator_status_text: bool = False,
+    max_frame_size: int | None = None,
 ) -> Path:
     if ep_targets is not None:
         ep_targets = _smooth_1d(ep_targets, smooth_window)
@@ -636,6 +677,7 @@ def _export_single_episode(
             timestamps_s=episode_timestamps_s,
             tolerance_s=tolerance_s,
             backend=video_backend,
+            max_frame_size=max_frame_size,
         )
     n_frames = min(len(decoded_frames), len(ep_values))
     if n_frames == 0:
@@ -728,6 +770,7 @@ def _export_single_episode_multiview(
     advantage_threshold: float | None = None,
     draw_indicator_persistent_marker: bool = False,
     draw_indicator_status_text: bool = False,
+    max_frame_size: int | None = None,
 ) -> Path:
     if ep_targets is not None:
         ep_targets = _smooth_1d(ep_targets, smooth_window)
@@ -750,6 +793,7 @@ def _export_single_episode_multiview(
                 timestamps_s=ts,
                 tolerance_s=tolerance_s,
                 backend=video_backend,
+                max_frame_size=max_frame_size,
             )
             all_cam_frames.append(frames)
 
@@ -848,6 +892,7 @@ def _export_overlay_videos(
     draw_indicator_status_text: bool = False,
     target_field: str | None = None,
     reward_field: str | None = None,
+    max_frame_size: int | None = None,
 ) -> list[Path]:
     selected_video_keys = _select_video_keys(
         camera_keys=list(dataset.meta.camera_keys),
@@ -962,7 +1007,9 @@ def _export_overlay_videos(
                         resolved_preloaded.append(frames)
                     else:
                         resolved_preloaded.append(
-                            _decode_frames_at_timestamps(src_path, ts, tolerance_s, video_backend)
+                            _decode_frames_at_timestamps(
+                                src_path, ts, tolerance_s, video_backend, max_frame_size=max_frame_size
+                            )
                         )
 
             dst_path = _build_output_video_path_multiview(
@@ -1018,6 +1065,7 @@ def _export_overlay_videos(
                     advantage_threshold=advantage_threshold,
                     draw_indicator_persistent_marker=draw_indicator_persistent_marker,
                     draw_indicator_status_text=draw_indicator_status_text,
+                    max_frame_size=max_frame_size,
                 )
             )
     else:
@@ -1104,6 +1152,7 @@ def _export_overlay_videos(
                     advantage_threshold=advantage_threshold,
                     draw_indicator_persistent_marker=draw_indicator_persistent_marker,
                     draw_indicator_status_text=draw_indicator_status_text,
+                    max_frame_size=max_frame_size,
                 )
             )
 
