@@ -80,6 +80,7 @@ class ValueInferenceACPConfig:
 
     write_mode: str = "sidecar"
     sidecar_subdir: str | None = None
+    streaming_write: bool = True
 
     def validate(self) -> None:
         if self.n_step <= 0:

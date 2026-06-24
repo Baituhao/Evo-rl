@@ -509,6 +509,157 @@ def _write_columns_sidecar(
     )
 
 
+def _write_columns_sidecar_streaming(
+    dataset_root: Path,
+    sidecar_subdir: str,
+    absolute_indices: np.ndarray,
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    task_indices: np.ndarray,
+    predicted_values: np.ndarray,
+    interventions: np.ndarray,
+    expert_episode_mask: np.ndarray,
+    episode_info: dict[int, Any],
+    task_max_lengths: dict[int, int],
+    value_cfg: Any,
+    cfg: Any,
+) -> None:
+    """Write sidecar parquet with chunked processing to reduce memory peaks.
+
+    Processes data in episode chunks: computes advantage/indicator for each chunk,
+    writes immediately, then releases memory before processing next chunk.
+
+    Args:
+        dataset_root: Root directory of the dataset
+        sidecar_subdir: Subdirectory name under <root>/advantage/
+        absolute_indices: Global frame indices
+        episode_indices: Episode index for each frame
+        frame_indices: Frame index within episode
+        task_indices: Task index for each frame
+        predicted_values: Model predictions
+        interventions: Intervention mask
+        expert_episode_mask: Expert episode mask
+        episode_info: Episode metadata
+        task_max_lengths: Max length per task
+        value_cfg: Value model config
+        cfg: Pipeline config
+    """
+    output_dir = dataset_root / "advantage" / sidecar_subdir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "frames.parquet"
+    tmp_path = output_dir / "frames.parquet.tmp"
+
+    # Build episode groups
+    unique_episodes = np.unique(episode_indices)
+    logging.info(
+        "Streaming write: processing %d episodes in chunks to reduce memory", len(unique_episodes)
+    )
+
+    # Schema for parquet writer
+    schema = pa.schema([
+        ("index", pa.int64()),
+        (cfg.acp.value_field, pa.float32()),
+        (cfg.acp.advantage_field, pa.float32()),
+        (cfg.acp.indicator_field, pa.int64()),
+    ])
+
+    # Open writer in append mode
+    writer = pq.ParquetWriter(tmp_path, schema, compression="snappy")
+
+    # First pass: collect all advantages to compute global thresholds
+    all_advantages = []
+    all_task_indices = []
+
+    for ep_idx in unique_episodes:
+        ep_mask = episode_indices == ep_idx
+        ep_absolute_indices = absolute_indices[ep_mask]
+        ep_episode_indices = episode_indices[ep_mask]
+        ep_frame_indices = frame_indices[ep_mask]
+        ep_task_indices = task_indices[ep_mask]
+        ep_values = predicted_values[ep_mask]
+
+        # Compute advantage for this episode
+        ep_value_targets = _compute_value_targets(
+            value_cfg, ep_episode_indices, ep_frame_indices, episode_info, task_max_lengths, cfg.acp.c_fail_coef
+        )
+        ep_rewards = _compute_rewards(value_cfg, ep_value_targets, ep_episode_indices, ep_frame_indices, episode_info)
+        ep_advantages = _compute_advantages(
+            value_cfg, ep_rewards, ep_values, ep_episode_indices, ep_frame_indices, cfg.acp.n_step, episode_info
+        )
+
+        all_advantages.append(ep_advantages)
+        all_task_indices.append(ep_task_indices)
+
+    # Concatenate for global threshold computation
+    all_advantages = np.concatenate(all_advantages)
+    all_task_indices = np.concatenate(all_task_indices)
+
+    # Compute global thresholds
+    thresholds = _compute_task_thresholds(all_task_indices, all_advantages, cfg.acp.positive_ratio)
+
+    logging.info("Computed global thresholds for %d tasks", len(thresholds))
+
+    # Second pass: write each episode with computed indicators
+    advantages_offset = 0
+    for ep_idx in unique_episodes:
+        ep_mask = episode_indices == ep_idx
+        ep_count = int(np.sum(ep_mask))
+        ep_absolute_indices = absolute_indices[ep_mask]
+        ep_values = predicted_values[ep_mask]
+        ep_task_indices = task_indices[ep_mask]
+        ep_interventions = interventions[ep_mask]
+        ep_expert_mask = expert_episode_mask[ep_mask]
+
+        # Retrieve pre-computed advantages
+        ep_advantages = all_advantages[advantages_offset : advantages_offset + ep_count]
+        advantages_offset += ep_count
+
+        # Binarize advantages to indicators using global thresholds
+        ep_indicators = _binarize_advantages(
+            ep_task_indices,
+            ep_advantages,
+            thresholds,
+            ep_interventions,
+            cfg.acp.force_intervention_positive,
+            ep_expert_mask,
+            cfg.acp.force_expert_episode_positive,
+        )
+
+        # Build PyArrow table for this episode (sorted by index)
+        sort_order = np.argsort(ep_absolute_indices)
+        table = pa.Table.from_pydict({
+            "index": pa.array(ep_absolute_indices[sort_order], type=pa.int64()),
+            cfg.acp.value_field: pa.array(ep_values[sort_order].astype(np.float32), type=pa.float32()),
+            cfg.acp.advantage_field: pa.array(ep_advantages[sort_order].astype(np.float32), type=pa.float32()),
+            cfg.acp.indicator_field: pa.array(ep_indicators[sort_order].astype(np.int64), type=pa.int64()),
+        })
+
+        # Write (append) this episode's table
+        writer.write_table(table)
+
+        # Free memory
+        del ep_values, ep_advantages, ep_indicators, table
+
+    writer.close()
+
+    # Read back, sort globally by index, and write final file
+    logging.info("Sorting sidecar parquet by index...")
+    full_table = pq.read_table(tmp_path)
+    sorted_table = full_table.sort_by([("index", "ascending")])
+
+    import os
+    os.replace(tmp_path, output_path)
+    pq.write_table(sorted_table, output_path, compression="snappy")
+
+    logging.info(
+        "Streaming write complete: %d rows to %s",
+        len(sorted_table),
+        output_path,
+    )
+
+    return thresholds
+
+
 def _write_columns_in_place(
     dataset_root: Path,
     absolute_indices: np.ndarray,
@@ -807,19 +958,33 @@ def run_value_inference_pipeline(
     eval_loader = accelerator.prepare(eval_loader)
 
     if accelerator.is_main_process:
-        max_abs_index = int(np.max(absolute_indices))
-        prediction_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
-        prediction_seen = np.zeros(max_abs_index + 1, dtype=np.bool_)
-        logging.info(
-            "Start value inference | world_size=%d batches=%d batch_size=%d checkpoint=%s",
-            accelerator.num_processes,
-            len(eval_loader),
-            cfg.runtime.batch_size,
-            pretrained_dir,
-        )
+        if cfg.acp.streaming_write:
+            # Streaming mode: use dict to accumulate (lower memory)
+            prediction_dict = {}
+            logging.info(
+                "Start value inference (streaming) | world_size=%d batches=%d batch_size=%d checkpoint=%s",
+                accelerator.num_processes,
+                len(eval_loader),
+                cfg.runtime.batch_size,
+                pretrained_dir,
+            )
+        else:
+            # Full-memory mode: pre-allocate lookup arrays
+            max_abs_index = int(np.max(absolute_indices))
+            prediction_lookup = np.zeros(max_abs_index + 1, dtype=np.float32)
+            prediction_seen = np.zeros(max_abs_index + 1, dtype=np.bool_)
+            prediction_dict = None
+            logging.info(
+                "Start value inference (full-memory) | world_size=%d batches=%d batch_size=%d checkpoint=%s",
+                accelerator.num_processes,
+                len(eval_loader),
+                cfg.runtime.batch_size,
+                pretrained_dir,
+            )
     else:
         prediction_lookup = None
         prediction_seen = None
+        prediction_dict = None
 
     value_policy.eval()
     eval_iter = tqdm(
@@ -847,21 +1012,35 @@ def run_value_inference_pipeline(
             if accelerator.is_main_process:
                 idx_np = gathered_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
                 val_np = gathered_val.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
-                prediction_lookup[idx_np] = val_np
-                prediction_seen[idx_np] = True
+
+                if cfg.acp.streaming_write:
+                    # Streaming: accumulate in dict
+                    for idx, val in zip(idx_np, val_np):
+                        prediction_dict[int(idx)] = float(val)
+                else:
+                    # Full-memory: accumulate in lookup array
+                    prediction_lookup[idx_np] = val_np
+                    prediction_seen[idx_np] = True
 
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        if prediction_lookup is None or prediction_seen is None:
-            raise RuntimeError("Prediction buffers unexpectedly missing on main process.")
+        if cfg.acp.streaming_write:
+            # Convert dict to array in dataset order
+            predicted_values = np.array([prediction_dict[int(idx)] for idx in absolute_indices], dtype=np.float32)
+            if len(predicted_values) != len(absolute_indices):
+                raise RuntimeError(f"Inference missing predictions for some frames.")
+        else:
+            # Full-memory mode: extract from lookup
+            if prediction_lookup is None or prediction_seen is None:
+                raise RuntimeError("Prediction buffers unexpectedly missing on main process.")
 
-        missing_mask = ~prediction_seen[absolute_indices]
-        if bool(np.any(missing_mask)):
-            missing_count = int(np.sum(missing_mask))
-            raise RuntimeError(f"Inference is missing predictions for {missing_count} frames.")
+            missing_mask = ~prediction_seen[absolute_indices]
+            if bool(np.any(missing_mask)):
+                missing_count = int(np.sum(missing_mask))
+                raise RuntimeError(f"Inference is missing predictions for {missing_count} frames.")
 
-        predicted_values = prediction_lookup[absolute_indices]
+            predicted_values = prediction_lookup[absolute_indices]
         logging.info(
             "Predicted value stats | min=%.6f max=%.6f mean=%.6f std=%.6f",
             float(np.min(predicted_values)),
@@ -881,104 +1060,172 @@ def run_value_inference_pipeline(
         thresholds: dict[int, float] | None = None
 
         if cfg.acp.enable:
+            # Build episode info (needed for both streaming and full-memory modes)
             episode_info, task_max_lengths = _build_episode_info(
                 dataset=dataset,
                 success_field=cfg.dataset.success_field,
                 default_success=cfg.dataset.default_success,
             )
 
-            value_targets = _compute_value_targets(
-                value_cfg=value_cfg,
-                episode_indices=episode_indices,
-                frame_indices=frame_indices,
-                episode_info=episode_info,
-                task_max_lengths=task_max_lengths,
-                c_fail_coef=cfg.acp.c_fail_coef,
-            )
-            rewards = _compute_rewards(
-                value_cfg=value_cfg,
-                targets=value_targets,
-                episode_indices=episode_indices,
-                frame_indices=frame_indices,
-                episode_info=episode_info,
-            )
-            advantages = _compute_advantages(
-                value_cfg=value_cfg,
-                rewards=rewards,
-                values=predicted_values,
-                episode_indices=episode_indices,
-                frame_indices=frame_indices,
-                n_step=cfg.acp.n_step,
-                episode_info=episode_info,
-            )
-            thresholds = _compute_task_thresholds(
-                task_indices=task_indices,
-                advantages=advantages,
-                positive_ratio=cfg.acp.positive_ratio,
-            )
-            indicators = _binarize_advantages(
-                task_indices=task_indices,
-                advantages=advantages,
-                thresholds=thresholds,
-                interventions=interventions,
-                force_intervention_positive=cfg.acp.force_intervention_positive,
-                expert_episode_mask=expert_episode_mask,
-                force_expert_episode_positive=cfg.acp.force_expert_episode_positive,
-            )
+            # Use streaming write (chunked processing) or full-memory mode
+            if cfg.acp.streaming_write and cfg.acp.write_mode == "sidecar":
+                logging.info("Using streaming write mode (chunked processing)")
 
-            indicator_positive_ratio = float(np.mean(indicators.astype(np.float32)))
-            logging.info(
-                "ACP stats | n_step=%d positive_ratio_target=%.4f positive_ratio_observed=%.4f",
-                cfg.acp.n_step,
-                cfg.acp.positive_ratio,
-                indicator_positive_ratio,
-            )
-            logging.info(
-                "ACP overrides | intervention_positive=%s intervention_frames=%d expert_episode_positive=%s "
-                "expert_episode_field=%s expert_episodes=%d expert_episode_frames=%d",
-                cfg.acp.force_intervention_positive,
-                int(np.sum(interventions.astype(np.float32) > 0.5)),
-                cfg.acp.force_expert_episode_positive,
-                cfg.acp.expert_episode_field,
-                int(np.unique(episode_indices[expert_episode_mask]).shape[0])
-                if bool(np.any(expert_episode_mask))
-                else 0,
-                int(np.sum(expert_episode_mask)),
-            )
+                # Derive sidecar subdir from value_field if not explicitly set
+                sidecar_subdir = cfg.acp.sidecar_subdir
+                if sidecar_subdir is None:
+                    prefix = "complementary_info.value_"
+                    if cfg.acp.value_field.startswith(prefix):
+                        sidecar_subdir = cfg.acp.value_field[len(prefix) :]
+                    else:
+                        sidecar_subdir = "default"
 
-            columns[cfg.acp.advantage_field] = advantages.astype(np.float32)
-            columns[cfg.acp.indicator_field] = indicators.astype(np.int64)
-            feature_infos[cfg.acp.advantage_field] = {"dtype": "float32", "shape": (1,), "names": None}
-            feature_infos[cfg.acp.indicator_field] = {"dtype": "int64", "shape": (1,), "names": None}
+                # Streaming write: processes in episode chunks, reduces memory peak
+                thresholds = _write_columns_sidecar_streaming(
+                    dataset_root=Path(dataset.root),
+                    sidecar_subdir=sidecar_subdir,
+                    absolute_indices=absolute_indices,
+                    episode_indices=episode_indices,
+                    frame_indices=frame_indices,
+                    task_indices=task_indices,
+                    predicted_values=predicted_values,
+                    interventions=interventions,
+                    expert_episode_mask=expert_episode_mask,
+                    episode_info=episode_info,
+                    task_max_lengths=task_max_lengths,
+                    value_cfg=value_cfg,
+                    cfg=cfg,
+                )
 
-        # Write columns: sidecar mode or in-place mode
-        if cfg.acp.write_mode == "sidecar":
-            # Derive sidecar subdir from value_field if not explicitly set
-            sidecar_subdir = cfg.acp.sidecar_subdir
-            if sidecar_subdir is None:
-                # Extract tag from value_field: "complementary_info.value_<tag>" -> "<tag>"
-                prefix = "complementary_info.value_"
-                if cfg.acp.value_field.startswith(prefix):
-                    sidecar_subdir = cfg.acp.value_field[len(prefix) :]
-                else:
-                    sidecar_subdir = "default"
-            _write_columns_sidecar(
-                dataset_root=Path(dataset.root),
-                sidecar_subdir=sidecar_subdir,
-                absolute_indices=absolute_indices,
-                columns=columns,
-                feature_infos=feature_infos,
-            )
-        elif cfg.acp.write_mode == "in_place":
-            _write_columns_in_place(
-                dataset_root=Path(dataset.root),
-                absolute_indices=absolute_indices,
-                columns=columns,
-                feature_infos=feature_infos,
-            )
-            logging.info("Wrote value annotations to dataset root (in_place): %s", dataset.root)
-        else:
-            raise ValueError(f"Invalid write_mode '{cfg.acp.write_mode}'")
+                # For viz and stats, read back from sidecar
+                sidecar_path = Path(dataset.root) / "advantage" / sidecar_subdir / "frames.parquet"
+                sidecar_table = pq.read_table(sidecar_path)
+
+                # Build lookup to extract values in dataset order
+                sidecar_indices = sidecar_table["index"].to_numpy()
+                max_idx = int(np.max(absolute_indices))
+
+                value_lookup = np.full(max_idx + 1, np.nan, dtype=np.float32)
+                advantage_lookup = np.full(max_idx + 1, np.nan, dtype=np.float32)
+                indicator_lookup = np.zeros(max_idx + 1, dtype=np.int64)
+
+                value_lookup[sidecar_indices] = sidecar_table[cfg.acp.value_field].to_numpy().astype(np.float32)
+                advantage_lookup[sidecar_indices] = sidecar_table[cfg.acp.advantage_field].to_numpy().astype(np.float32)
+                indicator_lookup[sidecar_indices] = sidecar_table[cfg.acp.indicator_field].to_numpy().astype(np.int64)
+
+                predicted_values = value_lookup[absolute_indices]
+                advantages = advantage_lookup[absolute_indices]
+                indicators = indicator_lookup[absolute_indices]
+
+                indicator_positive_ratio = float(np.mean(indicators.astype(np.float32)))
+
+                columns[cfg.acp.value_field] = predicted_values.astype(np.float32)
+                columns[cfg.acp.advantage_field] = advantages.astype(np.float32)
+                columns[cfg.acp.indicator_field] = indicators.astype(np.int64)
+
+                logging.info(
+                    "ACP stats (streaming) | n_step=%d positive_ratio_target=%.4f positive_ratio_observed=%.4f",
+                    cfg.acp.n_step,
+                    cfg.acp.positive_ratio,
+                    indicator_positive_ratio,
+                )
+            else:
+                # Original full-memory mode
+                logging.info("Using full-memory mode (compute all at once)")
+
+                value_targets = _compute_value_targets(
+                    value_cfg=value_cfg,
+                    episode_indices=episode_indices,
+                    frame_indices=frame_indices,
+                    episode_info=episode_info,
+                    task_max_lengths=task_max_lengths,
+                    c_fail_coef=cfg.acp.c_fail_coef,
+                )
+                rewards = _compute_rewards(
+                    value_cfg=value_cfg,
+                    targets=value_targets,
+                    episode_indices=episode_indices,
+                    frame_indices=frame_indices,
+                    episode_info=episode_info,
+                )
+                advantages = _compute_advantages(
+                    value_cfg=value_cfg,
+                    rewards=rewards,
+                    values=predicted_values,
+                    episode_indices=episode_indices,
+                    frame_indices=frame_indices,
+                    n_step=cfg.acp.n_step,
+                    episode_info=episode_info,
+                )
+                thresholds = _compute_task_thresholds(
+                    task_indices=task_indices,
+                    advantages=advantages,
+                    positive_ratio=cfg.acp.positive_ratio,
+                )
+                indicators = _binarize_advantages(
+                    task_indices=task_indices,
+                    advantages=advantages,
+                    thresholds=thresholds,
+                    interventions=interventions,
+                    force_intervention_positive=cfg.acp.force_intervention_positive,
+                    expert_episode_mask=expert_episode_mask,
+                    force_expert_episode_positive=cfg.acp.force_expert_episode_positive,
+                )
+
+                indicator_positive_ratio = float(np.mean(indicators.astype(np.float32)))
+                logging.info(
+                    "ACP stats | n_step=%d positive_ratio_target=%.4f positive_ratio_observed=%.4f",
+                    cfg.acp.n_step,
+                    cfg.acp.positive_ratio,
+                    indicator_positive_ratio,
+                )
+                logging.info(
+                    "ACP overrides | intervention_positive=%s intervention_frames=%d expert_episode_positive=%s "
+                    "expert_episode_field=%s expert_episodes=%d expert_episode_frames=%d",
+                    cfg.acp.force_intervention_positive,
+                    int(np.sum(interventions.astype(np.float32) > 0.5)),
+                    cfg.acp.force_expert_episode_positive,
+                    cfg.acp.expert_episode_field,
+                    int(np.unique(episode_indices[expert_episode_mask]).shape[0])
+                    if bool(np.any(expert_episode_mask))
+                    else 0,
+                    int(np.sum(expert_episode_mask)),
+                )
+
+                columns[cfg.acp.advantage_field] = advantages.astype(np.float32)
+                columns[cfg.acp.indicator_field] = indicators.astype(np.int64)
+                feature_infos[cfg.acp.advantage_field] = {"dtype": "float32", "shape": (1,), "names": None}
+                feature_infos[cfg.acp.indicator_field] = {"dtype": "int64", "shape": (1,), "names": None}
+
+        # Write columns: sidecar mode or in-place mode (only if not already written by streaming)
+        if not (cfg.acp.enable and cfg.acp.streaming_write and cfg.acp.write_mode == "sidecar"):
+            if cfg.acp.write_mode == "sidecar":
+                # Derive sidecar subdir from value_field if not explicitly set
+                sidecar_subdir = cfg.acp.sidecar_subdir
+                if sidecar_subdir is None:
+                    # Extract tag from value_field: "complementary_info.value_<tag>" -> "<tag>"
+                    prefix = "complementary_info.value_"
+                    if cfg.acp.value_field.startswith(prefix):
+                        sidecar_subdir = cfg.acp.value_field[len(prefix) :]
+                    else:
+                        sidecar_subdir = "default"
+                _write_columns_sidecar(
+                    dataset_root=Path(dataset.root),
+                    sidecar_subdir=sidecar_subdir,
+                    absolute_indices=absolute_indices,
+                    columns=columns,
+                    feature_infos=feature_infos,
+                )
+            elif cfg.acp.write_mode == "in_place":
+                _write_columns_in_place(
+                    dataset_root=Path(dataset.root),
+                    absolute_indices=absolute_indices,
+                    columns=columns,
+                    feature_infos=feature_infos,
+                )
+                logging.info("Wrote value annotations to dataset root (in_place): %s", dataset.root)
+            else:
+                raise ValueError(f"Invalid write_mode '{cfg.acp.write_mode}'")
 
         # Sync computed columns into the in-memory hf_dataset so viz can read them
         for field, values in columns.items():
