@@ -173,15 +173,37 @@ def decode_video_frames_torchvision(
     closest_frames = closest_frames.type(torch.float32) / 255
 
     assert len(timestamps) == len(closest_frames)
+
+    # Advise kernel to drop page cache for this video file
+    try:
+        import os
+        fd = os.open(video_path, os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+    except (OSError, AttributeError):
+        # posix_fadvise not available on this platform, skip silently
+        pass
+
     return closest_frames
 
 
 class VideoDecoderCache:
-    """Thread-safe cache for video decoders to avoid expensive re-initialization."""
+    """Thread-safe LRU cache for video decoders to avoid expensive re-initialization.
 
-    def __init__(self):
+    Limits cache size to prevent unbounded memory growth from page cache accumulation.
+    """
+
+    def __init__(self, max_size: int = 100):
+        """Initialize the cache with a maximum size limit.
+
+        Args:
+            max_size: Maximum number of decoders to cache. When exceeded, least recently
+                     used decoders are evicted and their page cache is dropped.
+        """
         self._cache: dict[str, tuple[Any, Any]] = {}
+        self._access_order: list[str] = []  # LRU tracking: most recent at end
         self._lock = Lock()
+        self._max_size = max_size
 
     def get_decoder(self, video_path: str):
         """Get a cached decoder or create a new one."""
@@ -193,19 +215,72 @@ class VideoDecoderCache:
         video_path = str(video_path)
 
         with self._lock:
-            if video_path not in self._cache:
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+            if video_path in self._cache:
+                # Move to end (most recently used)
+                self._access_order.remove(video_path)
+                self._access_order.append(video_path)
+                return self._cache[video_path][0]
 
-            return self._cache[video_path][0]
+            # Need to create new decoder
+            file_handle = fsspec.open(video_path).__enter__()
+            decoder = VideoDecoder(file_handle, seek_mode="approximate")
+
+            # Evict LRU if cache is full
+            if len(self._cache) >= self._max_size:
+                self._evict_lru()
+
+            self._cache[video_path] = (decoder, file_handle)
+            self._access_order.append(video_path)
+
+            return decoder
+
+    def _evict_lru(self):
+        """Evict the least recently used decoder and advise kernel to drop its page cache.
+
+        Must be called with self._lock held.
+        """
+        if not self._access_order:
+            return
+
+        # Remove least recently used (first in list)
+        lru_path = self._access_order.pop(0)
+        decoder, file_handle = self._cache.pop(lru_path)
+
+        # Close file handle
+        try:
+            file_handle.close()
+        except Exception:
+            pass
+
+        # Advise kernel to drop page cache for this video
+        try:
+            import os
+            fd = os.open(lru_path, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+        except (OSError, AttributeError):
+            pass
 
     def clear(self):
         """Clear the cache and close file handles."""
         with self._lock:
-            for _, file_handle in self._cache.values():
-                file_handle.close()
+            for video_path, (_, file_handle) in self._cache.items():
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+
+                # Drop page cache for each video
+                try:
+                    import os
+                    fd = os.open(video_path, os.O_RDONLY)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+                except (OSError, AttributeError):
+                    pass
+
             self._cache.clear()
+            self._access_order.clear()
 
     def size(self) -> int:
         """Return the number of cached decoders."""
@@ -304,6 +379,16 @@ def decode_video_frames_torchcodec(
         raise FrameTimestampError(
             f"Retrieved timestamps differ from queried {set(closest_frames) - set(timestamps)}"
         )
+
+    # Advise kernel to drop page cache for this video file
+    try:
+        import os
+        fd = os.open(str(video_path), os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+    except (OSError, AttributeError):
+        # posix_fadvise not available on this platform, skip silently
+        pass
 
     return closest_frames
 
