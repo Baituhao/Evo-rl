@@ -136,6 +136,8 @@ def decode_video_frames_torchvision(
     if backend == "pyav":
         reader.container.close()
 
+    # Explicitly delete reader to ensure immediate cleanup
+    del reader
     reader = None
 
     query_ts = torch.tensor(timestamps)
@@ -160,6 +162,9 @@ def decode_video_frames_torchvision(
     # get closest frames to the query timestamps
     closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
     closest_ts = loaded_ts[argmin_]
+
+    # Explicitly delete loaded frames to free memory
+    del loaded_frames, loaded_ts
 
     if log_loaded_timestamps:
         logging.info(f"{closest_ts=}")
@@ -285,6 +290,9 @@ def decode_video_frames_torchcodec(
     # get closest frames to the query timestamps
     closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
     closest_ts = loaded_ts[argmin_]
+
+    # Explicitly delete loaded frames to free memory
+    del loaded_frames, loaded_ts, frames_batch
 
     if log_loaded_timestamps:
         logging.info(f"{closest_ts=}")
