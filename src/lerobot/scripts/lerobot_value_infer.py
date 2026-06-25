@@ -950,7 +950,7 @@ def run_value_inference_pipeline(
         batch_size=cfg.runtime.batch_size,
         shuffle=False,
         num_workers=cfg.runtime.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,  # Disable to prevent pinned memory accumulation in WSS
         drop_last=False,
     )
 
@@ -1023,11 +1023,18 @@ def run_value_inference_pipeline(
 
                     # Periodically flush dict to temp storage to prevent WSS accumulation
                     if len(prediction_dict) >= chunk_size:
+                        import psutil
+                        process = psutil.Process()
+                        mem_before = process.memory_info().rss / 1024 / 1024  # MB
+
                         prediction_chunks.append(prediction_dict.copy())
                         prediction_dict.clear()
                         logging.info(f"Flushed prediction chunk {len(prediction_chunks)}, dict cleared")
                         import gc
                         gc.collect()
+
+                        mem_after = process.memory_info().rss / 1024 / 1024  # MB
+                        logging.info(f"Memory: before={mem_before:.1f}MB, after={mem_after:.1f}MB, freed={mem_before - mem_after:.1f}MB")
                 else:
                     # Full-memory: accumulate in lookup array
                     prediction_lookup[idx_np] = val_np
