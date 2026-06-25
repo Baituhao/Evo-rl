@@ -961,12 +961,15 @@ def run_value_inference_pipeline(
         if cfg.acp.streaming_write:
             # Streaming mode: use dict to accumulate (lower memory)
             prediction_dict = {}
+            prediction_chunks = []  # Store chunks to disk periodically
+            chunk_size = 5000  # Flush to disk every 5000 frames
             logging.info(
-                "Start value inference (streaming) | world_size=%d batches=%d batch_size=%d checkpoint=%s",
+                "Start value inference (streaming) | world_size=%d batches=%d batch_size=%d checkpoint=%s chunk_size=%d",
                 accelerator.num_processes,
                 len(eval_loader),
                 cfg.runtime.batch_size,
                 pretrained_dir,
+                chunk_size,
             )
         else:
             # Full-memory mode: pre-allocate lookup arrays
@@ -1017,19 +1020,50 @@ def run_value_inference_pipeline(
                     # Streaming: accumulate in dict
                     for idx, val in zip(idx_np, val_np):
                         prediction_dict[int(idx)] = float(val)
+
+                    # Periodically flush dict to temp storage to prevent WSS accumulation
+                    if len(prediction_dict) >= chunk_size:
+                        prediction_chunks.append(prediction_dict.copy())
+                        prediction_dict.clear()
+                        logging.info(f"Flushed prediction chunk {len(prediction_chunks)}, dict cleared")
+                        import gc
+                        gc.collect()
                 else:
                     # Full-memory: accumulate in lookup array
                     prediction_lookup[idx_np] = val_np
                     prediction_seen[idx_np] = True
 
+                # Explicitly delete tensors to free memory
+                del gathered_idx, gathered_val, idx_np, val_np
+
+            # Clear CUDA cache periodically to prevent accumulation
+            if accelerator.is_main_process and len(eval_iter) > 100:
+                batch_num = getattr(eval_iter, 'n', 0)
+                if batch_num % 100 == 0:
+                    torch.cuda.empty_cache()
+
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         if cfg.acp.streaming_write:
+            # Merge all chunks back into dict
+            if prediction_chunks:
+                logging.info(f"Merging {len(prediction_chunks)} chunks back into dict...")
+                for chunk in prediction_chunks:
+                    prediction_dict.update(chunk)
+                prediction_chunks.clear()
+                del prediction_chunks
+
             # Convert dict to array in dataset order
             predicted_values = np.array([prediction_dict[int(idx)] for idx in absolute_indices], dtype=np.float32)
             if len(predicted_values) != len(absolute_indices):
                 raise RuntimeError(f"Inference missing predictions for some frames.")
+
+            # Clear dict to free memory
+            prediction_dict.clear()
+            del prediction_dict
+            import gc
+            gc.collect()
         else:
             # Full-memory mode: extract from lookup
             if prediction_lookup is None or prediction_seen is None:
