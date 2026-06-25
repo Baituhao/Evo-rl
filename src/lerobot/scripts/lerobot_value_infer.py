@@ -952,7 +952,7 @@ def run_value_inference_pipeline(
         num_workers=cfg.runtime.num_workers,
         pin_memory=(device.type == "cuda"),  # Re-enable for faster CPU->GPU transfer
         drop_last=False,
-        prefetch_factor=1 if cfg.runtime.num_workers > 0 else None,  # Reduce from default 2 to 1
+        prefetch_factor=2 if cfg.runtime.num_workers > 0 else None,  # Keep PyTorch default
     )
 
     value_policy = accelerator.prepare(value_policy)
