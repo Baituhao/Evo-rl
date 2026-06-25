@@ -945,14 +945,20 @@ def run_value_inference_pipeline(
     else:
         expert_episode_mask = np.zeros(frame_count, dtype=np.bool_)
 
+    # Determine prefetch_factor: use config if set, otherwise PyTorch default (2 if workers > 0, None if workers = 0)
+    if cfg.runtime.prefetch_factor is not None:
+        prefetch_factor = cfg.runtime.prefetch_factor
+    else:
+        prefetch_factor = 2 if cfg.runtime.num_workers > 0 else None
+
     eval_loader = DataLoader(
         dataset,
         batch_size=cfg.runtime.batch_size,
         shuffle=False,
         num_workers=cfg.runtime.num_workers,
-        pin_memory=(device.type == "cuda"),  # Re-enable for faster CPU->GPU transfer
+        pin_memory=(device.type == "cuda"),
         drop_last=False,
-        prefetch_factor=2 if cfg.runtime.num_workers > 0 else None,  # Keep PyTorch default
+        prefetch_factor=prefetch_factor,
     )
 
     value_policy = accelerator.prepare(value_policy)

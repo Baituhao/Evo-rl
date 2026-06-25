@@ -54,12 +54,15 @@ class ValueInferenceRuntimeConfig:
     device: str = "cuda"
     batch_size: int = 64
     num_workers: int = 4
+    prefetch_factor: int | None = None  # None = use PyTorch default (2 if num_workers > 0)
 
     def validate(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("'runtime.batch_size' must be > 0.")
         if self.num_workers < 0:
             raise ValueError("'runtime.num_workers' must be >= 0.")
+        if self.prefetch_factor is not None and self.prefetch_factor < 0:
+            raise ValueError("'runtime.prefetch_factor' must be >= 0 or None.")
 
 
 @dataclass
