@@ -950,8 +950,9 @@ def run_value_inference_pipeline(
         batch_size=cfg.runtime.batch_size,
         shuffle=False,
         num_workers=cfg.runtime.num_workers,
-        pin_memory=False,  # Disable to prevent pinned memory accumulation in WSS
+        pin_memory=(device.type == "cuda"),  # Re-enable for faster CPU->GPU transfer
         drop_last=False,
+        prefetch_factor=1 if cfg.runtime.num_workers > 0 else None,  # Reduce from default 2 to 1
     )
 
     value_policy = accelerator.prepare(value_policy)
