@@ -193,7 +193,7 @@ class VideoDecoderCache:
     Limits cache size to prevent unbounded memory growth from page cache accumulation.
     """
 
-    def __init__(self, max_size: int = 100):
+    def __init__(self, max_size: int = 1000):
         """Initialize the cache with a maximum size limit.
 
         Args:
@@ -204,6 +204,9 @@ class VideoDecoderCache:
         self._access_order: list[str] = []  # LRU tracking: most recent at end
         self._lock = Lock()
         self._max_size = max_size
+        self._access_count = 0  # Track accesses for periodic cleanup
+        self._evict_count = 0   # Track total evictions for debugging
+        self._periodic_clear_count = 0  # Track periodic clears
 
     def get_decoder(self, video_path: str):
         """Get a cached decoder or create a new one."""
@@ -215,6 +218,25 @@ class VideoDecoderCache:
         video_path = str(video_path)
 
         with self._lock:
+            self._access_count += 1
+
+            # Every 500 accesses, evict 1/3 of cache to balance memory and performance
+            # (previously: every 100 accesses, evict 1/2 - too aggressive)
+            if self._access_count % 500 == 0 and len(self._cache) > 3:
+                evict_count = max(1, len(self._cache) // 3)
+                cache_size_before = len(self._cache)
+                for _ in range(evict_count):
+                    if self._access_order:
+                        self._evict_lru()
+                self._periodic_clear_count += 1
+                cache_size_after = len(self._cache)
+                logging.info(
+                    f"VideoDecoderCache periodic cleanup #{self._periodic_clear_count}: "
+                    f"cache_size {cache_size_before}→{cache_size_after}, "
+                    f"evicted {cache_size_before - cache_size_after}, "
+                    f"total_accesses={self._access_count}, total_evictions={self._evict_count}"
+                )
+
             if video_path in self._cache:
                 # Move to end (most recently used)
                 self._access_order.remove(video_path)
@@ -228,6 +250,12 @@ class VideoDecoderCache:
             # Evict LRU if cache is full
             if len(self._cache) >= self._max_size:
                 self._evict_lru()
+                if self._evict_count % 50 == 0:  # Log every 50 evictions
+                    logging.info(
+                        f"VideoDecoderCache LRU eviction: "
+                        f"cache_size={len(self._cache)}/{self._max_size}, "
+                        f"total_evictions={self._evict_count}"
+                    )
 
             self._cache[video_path] = (decoder, file_handle)
             self._access_order.append(video_path)
@@ -253,13 +281,26 @@ class VideoDecoderCache:
             pass
 
         # Advise kernel to drop page cache for this video
+        page_cache_dropped = False
         try:
             import os
             fd = os.open(lru_path, os.O_RDONLY)
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             os.close(fd)
-        except (OSError, AttributeError):
-            pass
+            page_cache_dropped = True
+        except (OSError, AttributeError) as e:
+            logging.debug(f"Failed to drop page cache for {lru_path}: {e}")
+
+        self._evict_count += 1
+
+        # Log detailed eviction info periodically
+        if self._evict_count % 100 == 0:
+            logging.info(
+                f"VideoDecoderCache eviction milestone: "
+                f"total_evictions={self._evict_count}, "
+                f"page_cache_dropped={page_cache_dropped}, "
+                f"current_cache_size={len(self._cache)}"
+            )
 
     def clear(self):
         """Clear the cache and close file handles."""
