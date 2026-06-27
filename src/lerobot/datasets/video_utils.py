@@ -220,22 +220,10 @@ class VideoDecoderCache:
         with self._lock:
             self._access_count += 1
 
-            # Every 500 accesses, evict 1/3 of cache to balance memory and performance
-            # (previously: every 100 accesses, evict 1/2 - too aggressive)
-            if self._access_count % 500 == 0 and len(self._cache) > 3:
-                evict_count = max(1, len(self._cache) // 3)
-                cache_size_before = len(self._cache)
-                for _ in range(evict_count):
-                    if self._access_order:
-                        self._evict_lru()
-                self._periodic_clear_count += 1
-                cache_size_after = len(self._cache)
-                logging.info(
-                    f"VideoDecoderCache periodic cleanup #{self._periodic_clear_count}: "
-                    f"cache_size {cache_size_before}→{cache_size_after}, "
-                    f"evicted {cache_size_before - cache_size_after}, "
-                    f"total_accesses={self._access_count}, total_evictions={self._evict_count}"
-                )
+            # Disabled periodic cleanup: page cache is managed by external monitoring scripts.
+            # The decoder objects themselves consume negligible memory (~few KB each).
+            # Aggressive cleanup was causing performance degradation (1.5 it/s → 4.6s/it spikes).
+
 
             if video_path in self._cache:
                 # Move to end (most recently used)
