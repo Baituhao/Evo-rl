@@ -976,6 +976,59 @@ def run_value_inference_pipeline(
     value_policy = accelerator.prepare(value_policy)
     eval_loader = accelerator.prepare(eval_loader)
 
+    # Check if using true streaming mode (completely bypasses normal inference loop)
+    if cfg.acp.enable and cfg.acp.streaming_write and cfg.acp.write_mode == "sidecar" and cfg.acp.true_streaming:
+        logging.info("Using TRUE streaming mode (episode-level with checkpoint resume)")
+
+        # Build episode info
+        episode_info, task_max_lengths = _build_episode_info(
+            dataset=dataset,
+            success_field=cfg.dataset.success_field,
+            default_success=cfg.dataset.default_success,
+        )
+
+        # Derive sidecar subdir
+        sidecar_subdir = cfg.acp.sidecar_subdir
+        if sidecar_subdir is None:
+            prefix = "complementary_info.value_"
+            if cfg.acp.value_field.startswith(prefix):
+                sidecar_subdir = cfg.acp.value_field[len(prefix) :]
+            else:
+                sidecar_subdir = "default"
+
+        # Import and run true streaming inference
+        from lerobot.scripts.value_infer_streaming import run_streaming_inference_with_resume
+
+        run_streaming_inference_with_resume(
+            dataset_root=Path(dataset.root),
+            sidecar_subdir=sidecar_subdir,
+            absolute_indices=absolute_indices,
+            episode_indices=episode_indices,
+            frame_indices=frame_indices,
+            task_indices=task_indices,
+            interventions=interventions,
+            expert_episode_mask=expert_episode_mask,
+            eval_loader=eval_loader,
+            model=value_policy,
+            preprocessor=preprocessor,
+            episode_info=episode_info,
+            task_max_lengths=task_max_lengths,
+            value_cfg=value_cfg,
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=output_dir,
+        )
+
+        # True streaming handles everything, return early
+        result = {
+            "main_process": accelerator.is_main_process,
+            "world_size": int(accelerator.num_processes),
+        }
+        accelerator.wait_for_everyone()
+        accelerator.end_training()
+        return result
+
+    # Normal inference loop (non-true-streaming paths)
     if accelerator.is_main_process:
         if cfg.acp.streaming_write:
             # Streaming mode: use dict to accumulate (lower memory)
@@ -1128,6 +1181,7 @@ def run_value_inference_pipeline(
             )
 
             # Use streaming write (chunked processing) or full-memory mode
+            # Note: true_streaming is handled earlier and returns early, so this only runs for legacy modes
             if cfg.acp.streaming_write and cfg.acp.write_mode == "sidecar":
                 logging.info("Using streaming write mode (chunked processing)")
 
@@ -1140,7 +1194,7 @@ def run_value_inference_pipeline(
                     else:
                         sidecar_subdir = "default"
 
-                # Streaming write: processes in episode chunks, reduces memory peak
+                # Legacy streaming write: processes in episode chunks, reduces memory peak
                 thresholds = _write_columns_sidecar_streaming(
                     dataset_root=Path(dataset.root),
                     sidecar_subdir=sidecar_subdir,
