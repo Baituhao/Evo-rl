@@ -10,7 +10,9 @@ import hashlib
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+import numpy as np
 
 
 @dataclass
@@ -62,6 +64,19 @@ class InferenceCheckpoint:
         self.last_update = datetime.now().isoformat()
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy types."""
+
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 def compute_config_hash(cfg: dict) -> str:
     """Compute a hash of the configuration for change detection.
 
@@ -88,7 +103,7 @@ def save_checkpoint(checkpoint: InferenceCheckpoint, checkpoint_path: Path) -> N
     # Write to temporary file first (atomic operation)
     tmp_path = checkpoint_path.with_suffix(".json.tmp")
     with open(tmp_path, "w") as f:
-        json.dump(asdict(checkpoint), f, indent=2)
+        json.dump(asdict(checkpoint), f, indent=2, cls=NumpyEncoder)
 
     # Atomic rename
     tmp_path.replace(checkpoint_path)

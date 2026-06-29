@@ -82,14 +82,13 @@ def _infer_single_episode_streaming(
     for raw_batch in eval_loader:
         batch_indices = raw_batch["index"]
 
-        # Only process on main process (gather happens inside)
-        if accelerator.is_main_process:
-            # Check which frames in this batch belong to current episode
-            batch_indices_np = batch_indices.cpu().numpy()
-            batch_in_episode = np.isin(batch_indices_np, ep_absolute_indices)
+        # Check which frames in this batch belong to current episode (all processes)
+        batch_indices_np = batch_indices.cpu().numpy()
+        batch_in_episode = np.isin(batch_indices_np, ep_absolute_indices)
 
-            if not batch_in_episode.any():
-                continue  # Skip batch if no frames from this episode
+        # All processes must skip together to avoid NCCL desync
+        if not batch_in_episode.any():
+            continue  # Skip batch if no frames from this episode
 
         # Run inference (all processes participate)
         processed_batch = preprocessor(raw_batch)
@@ -437,20 +436,38 @@ def run_streaming_inference_with_resume(
     unique_episodes = np.unique(episode_indices)
 
     for ep_idx in unique_episodes:
+        # Main process checks if episode is already completed
         if accelerator.is_main_process:
-            # Reload checkpoint to get latest state
             checkpoint = load_checkpoint(checkpoint_path)
 
-            # Skip if already completed
             if checkpoint.is_episode_completed(ep_idx):
                 logging.info(f"Episode {ep_idx} already completed, skipping")
-                continue
+                skip_episode_int = 1  # Skip this episode
+            else:
+                # Mark as current episode
+                checkpoint.set_current_episode(ep_idx)
+                save_checkpoint(checkpoint, checkpoint_path)
+                skip_episode_int = 0  # Don't skip
+        else:
+            # Non-main processes initialize to 0 (will be overwritten by broadcast)
+            skip_episode_int = 0
 
-            # Mark as current episode
-            checkpoint.set_current_episode(ep_idx)
-            save_checkpoint(checkpoint, checkpoint_path)
+        # Broadcast skip decision from rank 0 to all processes
+        import torch
+        import torch.distributed as dist
 
-        accelerator.wait_for_everyone()
+        skip_tensor = torch.tensor([skip_episode_int], dtype=torch.int32).to(accelerator.device)
+
+        if dist.is_initialized():
+            # Broadcast is a collective operation - all processes must call it
+            dist.broadcast(skip_tensor, src=0)
+
+        # All processes now have the same decision
+        skip_episode = bool(skip_tensor.item())
+
+        if skip_episode:
+            # All processes skip together - safe!
+            continue
 
         # Infer this episode (all processes participate, but only main writes)
         ep_mask = episode_indices == ep_idx
