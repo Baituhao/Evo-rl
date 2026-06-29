@@ -18,6 +18,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
@@ -453,9 +454,6 @@ def run_streaming_inference_with_resume(
             skip_episode_int = 0
 
         # Broadcast skip decision from rank 0 to all processes
-        import torch
-        import torch.distributed as dist
-
         skip_tensor = torch.tensor([skip_episode_int], dtype=torch.int32).to(accelerator.device)
 
         if dist.is_initialized():
