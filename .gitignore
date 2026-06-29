@@ -183,21 +183,21 @@ wandb/
 # Dev scripts
 .dev/
 
-# Data folders
+# Data folders and symlinks
 data/
 outputs/
-outputs_oss/
-outputs_cpfs/
-outputs_cpfs_b5/
+outputs_oss
+outputs_cpfs
+outputs_cpfs_b5
 datasets/
-datasets_cpfs/
-datasets_cpfs_b5_shenjian/
-datasets_oss/
-datasets_shenjian/
-datasets_shenjian_oss/
+datasets_cpfs
+datasets_cpfs_b5_shenjian
+datasets_oss
+datasets_shenjian
+datasets_shenjian_oss
 
 # Bash lerobot (symlink to external bash scripts)
-bash_lerobot/
+bash_lerobot
 
 # Backup files
 *.backup
