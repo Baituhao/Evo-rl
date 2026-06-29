@@ -1,4 +1,4 @@
-# True Streaming Inference with Checkpoint Resume
+# Streaming Inference with Checkpoint Resume
 
 ## 概述
 
@@ -11,43 +11,39 @@
 3. **内存可控**：峰值内存 = 单个 episode（~100 帧 ≈ 几 MB）
 4. **容错性强**：checkpoint 机制保证进度不丢失
 
-### 📊 与其他模式对比
+### 📊 与全量模式对比
 
 | 模式 | 内存占用 | 断点续推 | NCCL 超时风险 | 适用场景 |
 |------|---------|----------|--------------|---------|
-| 全量内存 | ~2 MB | ❌ | ✅ 低 | 小数据集（< 50 万帧） |
-| 假流式 | ~15 MB | ❌ | ❌ 高 | 已废弃 |
-| **真流式** | **~5 MB** | **✅ 支持** | **✅ 低** | **大数据集，长时间推理** |
+| 全量内存 (`streaming_write=false`) | ~2 MB | ❌ | ✅ 低 | 小数据集（< 50 万帧） |
+| **流式模式 (`streaming_write=true`)** | **~5 MB** | **✅ 支持** | **✅ 低** | **大数据集，长时间推理** |
 
 ---
 
 ## 使用方法
 
-### 1. 启用真流式推理
+### 1. 启用流式推理
 
 在启动脚本中添加参数：
 
 ```bash
 accelerate launch \
     -m lerobot.scripts.lerobot_value_infer \
-    --acp.streaming_write=true \
-    --acp.true_streaming=true \      # 启用真正的流式推理
+    --acp.streaming_write=true \      # 启用流式推理（默认已启用）
     --acp.write_mode=sidecar \
     # ... 其他参数
 ```
 
-### 2. 配置选项
+### 2. 使用全量内存模式
+
+如果想使用全量内存模式（更快但无断点续推）：
 
 ```bash
-# 必需参数
---acp.true_streaming=true          # 启用真流式
---acp.streaming_write=true         # 必须同时启用
---acp.write_mode=sidecar           # 必须使用 sidecar 模式
-
-# 可选参数
---acp.sidecar_subdir=<tag>         # Sidecar 子目录名称
---runtime.batch_size=16            # 批量大小
---runtime.num_workers=4            # DataLoader worker 数量
+accelerate launch \
+    -m lerobot.scripts.lerobot_value_infer \
+    --acp.streaming_write=false \     # 禁用流式，使用全量内存
+    --acp.write_mode=sidecar \
+    # ... 其他参数
 ```
 
 ---

@@ -83,10 +83,10 @@ class ValueInferenceACPConfig:
 
     write_mode: str = "sidecar"
     sidecar_subdir: str | None = None
+    # Streaming write: episode-level processing with checkpoint resume
+    # True: streaming mode (minimal memory, checkpoint resume)
+    # False: full-memory mode (fast but no resume, requires all data in memory)
     streaming_write: bool = True
-    # True streaming: episode-level granularity with checkpoint resume
-    # False: legacy behavior (full memory or fake streaming)
-    true_streaming: bool = False
 
     def validate(self) -> None:
         if self.n_step <= 0:
