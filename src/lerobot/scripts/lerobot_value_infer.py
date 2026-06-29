@@ -114,6 +114,18 @@ def _create_accelerator(cfg: ValueInferencePipelineConfig, accelerator: Accelera
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     force_cpu = cfg.runtime.device == "cpu"
+
+    # Monkey-patch torch.distributed.init_process_group to increase NCCL timeout
+    # Default is 10 minutes, increase to 30 minutes for large datasets
+    import torch.distributed as dist
+    from datetime import timedelta
+    original_init = dist.init_process_group
+    def patched_init(*args, **kwargs):
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = timedelta(minutes=30)
+        return original_init(*args, **kwargs)
+    dist.init_process_group = patched_init
+
     return Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs], cpu=force_cpu)
 
 
