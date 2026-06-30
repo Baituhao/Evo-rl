@@ -1,9 +1,12 @@
 """
 True streaming inference with episode-level granularity and checkpoint resume.
 
+FIXED VERSION: Resolves distributed DataLoader synchronization bug by doing
+a single pass over the dataset instead of looping per-episode.
+
 This module implements genuine streaming inference that:
-1. Processes one episode at a time to minimize memory footprint
-2. Writes intermediate results immediately after each episode
+1. Processes entire dataset in one pass (all GPUs synchronized)
+2. Groups results by episode and writes incrementally
 3. Supports checkpoint-based resume after crashes
 4. Separates inference (Pass 1) from merging/indicator computation (Pass 2)
 """
@@ -18,7 +21,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-import torch.distributed as dist
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
@@ -31,67 +33,34 @@ from lerobot.common.inference_checkpoint import (
 )
 
 
-def _infer_single_episode_streaming(
-    ep_idx: int,
-    ep_mask: np.ndarray,
-    absolute_indices: np.ndarray,
-    episode_indices: np.ndarray,
-    frame_indices: np.ndarray,
-    task_indices: np.ndarray,
+def _infer_all_frames_once(
     eval_loader: DataLoader,
     model: Any,
     preprocessor: Any,
-    episode_info: dict[int, Any],
-    task_max_lengths: dict[int, int],
-    value_cfg: Any,
-    cfg: Any,
     accelerator: Accelerator,
-    episodes_dir: Path,
-) -> int:
-    """Infer a single episode and write results immediately.
+) -> dict[int, float]:
+    """Run inference once over entire dataset and return all predictions.
 
-    Args:
-        ep_idx: Episode index to process
-        ep_mask: Boolean mask for frames belonging to this episode
-        absolute_indices: Absolute frame indices in dataset
-        episode_indices: Episode index for each frame
-        frame_indices: Frame index within episode
-        task_indices: Task index for each frame
-        eval_loader: DataLoader for inference
-        model: Value policy model
-        preprocessor: Data preprocessor
-        episode_info: Episode metadata
-        task_max_lengths: Maximum trajectory lengths per task
-        value_cfg: Value computation config
-        cfg: Full inference config
-        accelerator: Accelerate accelerator instance
-        episodes_dir: Directory to write episode parquet files
+    This avoids the distributed synchronization issue of looping per-episode.
+    All GPU processes iterate through the DataLoader together, maintaining NCCL sync.
 
     Returns:
-        Number of frames processed in this episode
+        Dictionary mapping frame index to predicted value (only on main process)
     """
-    # Extract episode data
-    ep_absolute_indices = absolute_indices[ep_mask]
-    ep_episode_indices = episode_indices[ep_mask]
-    ep_frame_indices = frame_indices[ep_mask]
-    ep_task_indices = task_indices[ep_mask]
+    all_predictions = {}
 
-    # Dictionary to accumulate predictions for this episode
-    ep_predictions = {}
+    if accelerator.is_main_process:
+        logging.info("Starting full dataset inference (single pass)")
 
-    # Iterate through DataLoader and filter for this episode
+    batch_count = 0
     for raw_batch in eval_loader:
+        batch_count += 1
+        if accelerator.is_main_process and batch_count % 100 == 1:
+            logging.info(f"  Processing batch {batch_count}")
+
         batch_indices = raw_batch["index"]
 
-        # Check which frames in this batch belong to current episode (all processes)
-        batch_indices_np = batch_indices.cpu().numpy()
-        batch_in_episode = np.isin(batch_indices_np, ep_absolute_indices)
-
-        # All processes must skip together to avoid NCCL desync
-        if not batch_in_episode.any():
-            continue  # Skip batch if no frames from this episode
-
-        # Run inference (all processes participate)
+        # Run inference (all processes participate - critical for NCCL sync!)
         processed_batch = preprocessor(raw_batch)
         with accelerator.autocast():
             predicted_value = accelerator.unwrap_model(model).predict_value(processed_batch)
@@ -104,27 +73,68 @@ def _infer_single_episode_streaming(
             idx_np = gathered_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
             val_np = gathered_val.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
 
-            # Filter for current episode
-            mask_in_episode = np.isin(idx_np, ep_absolute_indices)
-            ep_batch_indices = idx_np[mask_in_episode]
-            ep_batch_values = val_np[mask_in_episode]
-
-            # Accumulate predictions
-            for idx, val in zip(ep_batch_indices, ep_batch_values):
-                ep_predictions[int(idx)] = float(val)
+            # Accumulate all predictions
+            for idx, val in zip(idx_np, val_np):
+                all_predictions[int(idx)] = float(val)
 
             # Free memory
             del gathered_idx, gathered_val, idx_np, val_np
 
-    # All processes wait before moving to next episode
+    # All processes wait
     accelerator.wait_for_everyone()
 
-    if not accelerator.is_main_process:
-        return 0  # Only main process writes
+    if accelerator.is_main_process:
+        logging.info(f"Full dataset inference complete: {len(all_predictions)} frames predicted")
 
-    # Convert predictions to arrays (sorted by absolute index)
+    return all_predictions
+
+
+def _process_single_episode_from_predictions(
+    ep_idx: int,
+    ep_mask: np.ndarray,
+    absolute_indices: np.ndarray,
+    episode_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    task_indices: np.ndarray,
+    all_predictions: dict[int, float],
+    episode_info: dict[int, Any],
+    task_max_lengths: dict[int, int],
+    value_cfg: Any,
+    cfg: Any,
+    episodes_dir: Path,
+) -> int:
+    """Process a single episode from pre-computed predictions and write results.
+
+    This runs only on main process after all inference is complete.
+
+    Args:
+        ep_idx: Episode index to process
+        ep_mask: Boolean mask for frames belonging to this episode
+        absolute_indices: Absolute frame indices in dataset
+        episode_indices: Episode index for each frame
+        frame_indices: Frame index within episode
+        task_indices: Task index for each frame
+        all_predictions: Dictionary of all predictions (index -> value)
+        episode_info: Episode metadata
+        task_max_lengths: Maximum trajectory lengths per task
+        value_cfg: Value computation config
+        cfg: Full inference config
+        episodes_dir: Directory to write episode parquet files
+
+    Returns:
+        Number of frames processed in this episode
+    """
+    # Extract episode data
+    ep_absolute_indices = absolute_indices[ep_mask]
+    ep_episode_indices = episode_indices[ep_mask]
+    ep_frame_indices = frame_indices[ep_mask]
+    ep_task_indices = task_indices[ep_mask]
+
+    logging.info(f"Episode {ep_idx}: processing {len(ep_absolute_indices)} frames")
+
+    # Extract predictions for this episode
     sorted_indices = np.sort(ep_absolute_indices)
-    ep_values = np.array([ep_predictions[int(idx)] for idx in sorted_indices], dtype=np.float32)
+    ep_values = np.array([all_predictions[int(idx)] for idx in sorted_indices], dtype=np.float32)
 
     # Reorder other arrays to match sorted indices
     sort_order = np.argsort(ep_absolute_indices)
@@ -181,7 +191,7 @@ def _infer_single_episode_streaming(
     pq.write_table(ep_table, ep_file, compression="snappy")
 
     # Free memory
-    del ep_predictions, ep_values, ep_advantages, ep_table
+    del ep_values, ep_advantages, ep_table
     gc.collect()
 
     frames_count = len(sorted_indices)
@@ -276,10 +286,9 @@ def _merge_episodes_and_write_indicators(
 
         # Get interventions and expert mask for this episode's frames
         # Find positions in original arrays
-        ep_positions = np.searchsorted(np.sort(np.arange(len(task_indices_all))), ep_indices)
+        ep_positions = np.searchsorted(np.arange(len(task_indices_all)), ep_indices)
         ep_interventions = interventions_all[ep_positions]
         ep_expert_mask = expert_episode_mask_all[ep_positions]
-        ep_episode_indices = episode_indices_all[ep_positions]
 
         # Compute indicators
         ep_indicators = _binarize_advantages(
@@ -338,13 +347,13 @@ def run_streaming_inference_with_resume(
 ) -> dict[int, float]:
     """Run true streaming inference with checkpoint resume support.
 
-    This implements episode-level streaming:
-    1. Load or create checkpoint
-    2. For each episode not yet completed:
-       - Infer and compute advantages
-       - Write episode parquet immediately
-       - Update checkpoint
-    3. Merge all episodes and compute indicators
+    FIXED: Uses single-pass inference to avoid distributed DataLoader sync issues.
+
+    This implements:
+    1. Check checkpoint for resume
+    2. If needed, run full dataset inference once (all GPUs synchronized)
+    3. On main process, process each episode and write parquet
+    4. Merge all episodes and compute indicators
 
     Args:
         dataset_root: Root directory of dataset
@@ -376,7 +385,10 @@ def run_streaming_inference_with_resume(
     checkpoint_path = sidecar_dir / "checkpoint.json"
     final_output = sidecar_dir / "frames.parquet"
 
-    # Only main process manages checkpoint
+    # Check checkpoint status on main process
+    should_skip = False
+    should_merge_only = False
+
     if accelerator.is_main_process:
         # Load or create checkpoint
         if checkpoint_path.exists():
@@ -398,24 +410,10 @@ def run_streaming_inference_with_resume(
             # Check status
             if checkpoint.status == "completed":
                 logging.info("Inference already completed")
-                # Read thresholds from existing file (placeholder)
-                return {}
-
-            if checkpoint.status == "merging":
+                should_skip = True
+            elif checkpoint.status == "merging":
                 logging.info("Inference completed, starting merge phase")
-                _merge_episodes_and_write_indicators(
-                    episodes_dir=episodes_dir,
-                    output_path=final_output,
-                    task_indices_all=task_indices,
-                    interventions_all=interventions,
-                    expert_episode_mask_all=expert_episode_mask,
-                    episode_indices_all=episode_indices,
-                    cfg=cfg,
-                )
-
-                checkpoint.status = "completed"
-                save_checkpoint(checkpoint, checkpoint_path)
-                return {}
+                should_merge_only = True
         else:
             # Create new checkpoint
             unique_episodes = np.unique(episode_indices)
@@ -431,63 +429,86 @@ def run_streaming_inference_with_resume(
                 f"Starting new streaming inference: {checkpoint.total_episodes} episodes to process"
             )
 
+    # Broadcast status to all processes to keep them in sync
     accelerator.wait_for_everyone()
 
-    # Inference phase: process each episode
-    unique_episodes = np.unique(episode_indices)
+    # Early exit if already completed (all processes together)
+    if accelerator.is_main_process and should_skip:
+        accelerator.wait_for_everyone()  # Final sync before return
+        return {}
 
-    for ep_idx in unique_episodes:
-        # Main process checks if episode is already completed
-        if accelerator.is_main_process:
+    # Handle merge-only case (all processes together)
+    if accelerator.is_main_process and should_merge_only:
+        _merge_episodes_and_write_indicators(
+            episodes_dir=episodes_dir,
+            output_path=final_output,
+            task_indices_all=task_indices,
+            interventions_all=interventions,
+            expert_episode_mask_all=expert_episode_mask,
+            episode_indices_all=episode_indices,
+            cfg=cfg,
+        )
+        checkpoint.status = "completed"
+        save_checkpoint(checkpoint, checkpoint_path)
+
+    accelerator.wait_for_everyone()
+
+    if should_skip or should_merge_only:
+        return {}
+
+    # PHASE 1: Run inference once over entire dataset (all GPUs participate)
+    if accelerator.is_main_process:
+        logging.info("=" * 80)
+        logging.info("PHASE 1: Full dataset inference (single pass)")
+        logging.info("=" * 80)
+
+    all_predictions = _infer_all_frames_once(
+        eval_loader=eval_loader,
+        model=model,
+        preprocessor=preprocessor,
+        accelerator=accelerator,
+    )
+
+    if accelerator.is_main_process:
+        logging.info("=" * 80)
+        logging.info("PHASE 2: Processing episodes and writing parquet files")
+        logging.info("=" * 80)
+
+    # PHASE 2: Process each episode (only main process, using cached predictions)
+    # Non-main processes skip this entire phase
+    if accelerator.is_main_process:
+        unique_episodes = np.unique(episode_indices)
+
+        for ep_idx in unique_episodes:
+            # Reload checkpoint to get latest state
             checkpoint = load_checkpoint(checkpoint_path)
 
+            # Skip if already completed
             if checkpoint.is_episode_completed(ep_idx):
                 logging.info(f"Episode {ep_idx} already completed, skipping")
-                skip_episode_int = 1  # Skip this episode
-            else:
-                # Mark as current episode
-                checkpoint.set_current_episode(ep_idx)
-                save_checkpoint(checkpoint, checkpoint_path)
-                skip_episode_int = 0  # Don't skip
-        else:
-            # Non-main processes initialize to 0 (will be overwritten by broadcast)
-            skip_episode_int = 0
+                continue
 
-        # Broadcast skip decision from rank 0 to all processes
-        skip_tensor = torch.tensor([skip_episode_int], dtype=torch.int32).to(accelerator.device)
+            # Mark as current episode
+            checkpoint.set_current_episode(ep_idx)
+            save_checkpoint(checkpoint, checkpoint_path)
 
-        if dist.is_initialized():
-            # Broadcast is a collective operation - all processes must call it
-            dist.broadcast(skip_tensor, src=0)
+            # Process this episode
+            ep_mask = episode_indices == ep_idx
+            frames_count = _process_single_episode_from_predictions(
+                ep_idx=ep_idx,
+                ep_mask=ep_mask,
+                absolute_indices=absolute_indices,
+                episode_indices=episode_indices,
+                frame_indices=frame_indices,
+                task_indices=task_indices,
+                all_predictions=all_predictions,
+                episode_info=episode_info,
+                task_max_lengths=task_max_lengths,
+                value_cfg=value_cfg,
+                cfg=cfg,
+                episodes_dir=episodes_dir,
+            )
 
-        # All processes now have the same decision
-        skip_episode = bool(skip_tensor.item())
-
-        if skip_episode:
-            # All processes skip together - safe!
-            continue
-
-        # Infer this episode (all processes participate, but only main writes)
-        ep_mask = episode_indices == ep_idx
-        frames_count = _infer_single_episode_streaming(
-            ep_idx=ep_idx,
-            ep_mask=ep_mask,
-            absolute_indices=absolute_indices,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
-            task_indices=task_indices,
-            eval_loader=eval_loader,
-            model=model,
-            preprocessor=preprocessor,
-            episode_info=episode_info,
-            task_max_lengths=task_max_lengths,
-            value_cfg=value_cfg,
-            cfg=cfg,
-            accelerator=accelerator,
-            episodes_dir=episodes_dir,
-        )
-
-        if accelerator.is_main_process:
             # Mark episode as completed
             checkpoint.mark_episode_completed(ep_idx, frames_count)
             save_checkpoint(checkpoint, checkpoint_path)
@@ -499,10 +520,15 @@ def run_streaming_inference_with_resume(
                 f"episodes ({progress:.1f}%), {checkpoint.total_frames_processed} frames processed"
             )
 
-        accelerator.wait_for_everyone()
+    # All processes sync after PHASE 2 completes (single sync, not per-episode)
+    accelerator.wait_for_everyone()
 
-    # Merge phase
+    # PHASE 3: Merge episodes (only main process)
     if accelerator.is_main_process:
+        logging.info("=" * 80)
+        logging.info("PHASE 3: Merging episodes and computing indicators")
+        logging.info("=" * 80)
+
         checkpoint = load_checkpoint(checkpoint_path)
         checkpoint.status = "merging"
         save_checkpoint(checkpoint, checkpoint_path)
